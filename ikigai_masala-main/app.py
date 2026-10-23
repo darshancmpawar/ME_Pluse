@@ -522,11 +522,16 @@ with st.sidebar:
     # Regional days. OFF by default and the only thing that reveals the whole
     # section — nothing about the planner changes, and no workbook is read for
     # regions, until somebody switches it on.
-    regional_on = st.toggle(
-        "Regional days", value=False, key="planner_regional_on",
-        help="Give a day a regional focus (a Tamil Nadu Thursday) on top of "
-             "its cuisine theme. Pick before generating, or after — applying "
-             "re-solves only that day.")
+    # FEATURE DISABLED (temporary) — regional days. Withholding the toggle is
+    # the whole switch: the sidebar control, the region strip below and the
+    # `region_days` solve argument are all already gated on `regional_on`.
+    # To restore: delete the assignment, un-comment the toggle.
+    regional_on = False
+    # regional_on = st.toggle(
+    #     "Regional days", value=False, key="planner_regional_on",
+    #     help="Give a day a regional focus (a Tamil Nadu Thursday) on top of "
+    #          "its cuisine theme. Pick before generating, or after — applying "
+    #          "re-solves only that day.")
 
     st.divider()
     generate_clicked = st.button("Generate Menu Plan", type="primary",
@@ -1728,7 +1733,11 @@ def _render_one_block(api, b, block_index: int, counter_index: int,
         # could and could not look at. `dishes` is cached per (client, city,
         # dates) because Streamlit resends every component argument on every
         # rerun — see `_pick_dishes`.
-        dishes=_pick_dishes(b, counter_index),
+        # FEATURE DISABLED (temporary) — Pick mode. An empty dish list is the
+        # component's own "no Pick" state: `hasDishes()` in
+        # ui/menu_table/index.html withholds the Auto/Pick control entirely,
+        # so the table stays in Auto. To restore: un-comment the call.
+        dishes={},  # dishes=_pick_dishes(b, counter_index),
         exceptions=b.get("exceptions") or [],
         undo=b.get("pick_undo") or {}, undo_order=b.get("pick_order") or [],
         city=_pick_cfg.get("city") or "",
@@ -1762,7 +1771,11 @@ def _render_one_block(api, b, block_index: int, counter_index: int,
             b["plan"], b["plan_dates"], b["day_types"] = {}, [], {}
             b["nonveg"] = {}
             st.rerun()
-    _render_explain_expander(api, block_index, counter_index, key_ns)
+    # FEATURE DISABLED (temporary) — "Why this menu". This call is also the
+    # only writer of st.session_state["explanations"], so the per-day Explain
+    # panel inside the table above stays empty and its button never appears.
+    # To restore: un-comment the call.
+    # _render_explain_expander(api, block_index, counter_index, key_ns)
 
 
 def _saveable_meals(meal_blocks, fallback_blocks):
