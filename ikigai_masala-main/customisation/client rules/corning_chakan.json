@@ -1,0 +1,240 @@
+{
+  "Corning Chakan": {
+    "_comment": "Pune site, one counter, seven days a week (`serve_weekends` is true, which the soup/sweet schedule below depends on). Slots: soup, bread, rice, white_rice, veg_dry, veg_gravy, dal, dessert, starter — one dish each. The starter category now EXISTS on the counter, so the Thursday chaat rules below are live; they were written while it did not and their comments said so. Five of the client's fourteen rules need no per-client entry because Pune's own ruleset already enforces them at least as tightly: 'kabuli chana gravy max once a week' is `kabuli_chana_gravy_weekly`, 'legume-based gravies max once a week' is `legume_gravy_weekly`, and 'mixed-veg, veg kurma and veg kofta max twice a week' is covered by `mixed_veg_gravy_weekly` + `veg_kurma_gravy_weekly` + `veg_kofta_gravy_weekly` (one day each) — the union cap below is added anyway because the client stated the combined number, and a city rule can be relaxed later without the client's requirement quietly going with it. 'Sweet and soup on alternate days' is not a rule: it is what the two day-restrictions below already produce (sweet Mon/Wed/Fri, soup Tue/Thu/Sat/Sun). 'Soya can be served as one of the vegetable options' is permission, not a constraint, so nothing enforces it — Pune carries soya veg dries and gravies and they are already eligible.",
+    "disable": [
+      "leafy_veg_dry_15d_window"
+    ],
+    "_meal_shared_why": "'dessert, soup and indian bread shall be the same as Lunch' — the DINNER service repeats the lunch dish for these three slots, on the same day. It is the exact opposite of the planner's default, which bans every lunch dish at dinner (note 39), so it cannot be a solver rule: the two services are separate solves and neither can see the other. The planner pins the lunch dish in and leaves these slots out of the exclusion it would otherwise send. `bread` is here for completeness and is already true by another route — the chapati pin below is client-wide, so both services serve it anyway; listing it means the requirement survives the pin being changed. Soup and dessert are the halves that actually need this: both are day-restricted at this site and the dish varies by day.",
+    "meal_shared_categories": [
+      "dessert",
+      "soup",
+      "bread"
+    ],
+    "use": [],
+    "rules": [
+      {
+        "_comment": "'Soup should be served on Tuesday, Thursday, Saturday and Sunday.' The station stands down on the other three days, which is the half of the alternation that puts soup opposite the sweet.",
+        "name": "corning_chakan_soup_tue_thu_sat_sun",
+        "type": "slot_day_restriction",
+        "base_slot": "soup",
+        "allowed_weekdays": [
+          "tue",
+          "thu",
+          "sat",
+          "sun"
+        ]
+      },
+      {
+        "_comment": "'Sweets should be served on Monday, Wednesday and Friday.' The other half. Together with the soup restriction this IS 'sweet and soup on alternate days' — every day carries exactly one of the two, so no third rule is needed and none is added.",
+        "name": "corning_chakan_dessert_mon_wed_fri",
+        "type": "slot_day_restriction",
+        "base_slot": "dessert",
+        "allowed_weekdays": [
+          "mon",
+          "wed",
+          "fri"
+        ]
+      },
+      {
+        "_comment": "'Liquid sweets should not be considered.' A ban, written as `max: 0` over the 14 liquid desserts (the kheer / phirni / payasam / custard family) — 43 of Pune's 57 desserts remain, comfortably more than the three sweet days a week need across the 20-day cooldown.",
+        "name": "corning_chakan_no_liquid_sweets",
+        "type": "selector_frequency",
+        "base_slot": "dessert",
+        "selector": {
+          "flag": "is_liquid_dessert"
+        },
+        "max": 0
+      },
+      {
+        "_comment": "'All black dal preparations combined should be served maximum once a week.' Pune's three black dals (dal makhani, dhaba dal, maa ki dal) are one family for this purpose, which is what 'combined' means — a single rule over the flag, not one per dish.",
+        "name": "corning_chakan_black_dal_weekly",
+        "type": "selector_frequency",
+        "base_slot": "dal",
+        "selector": {
+          "flag": "is_black_dal"
+        },
+        "max_per_week": 1
+      },
+      {
+        "_comment": "'Sprouts gravy should be served AT LEAST twice a week.' A floor, not a cap — this was written as `max_per_week: 2` against an earlier reading ('maximum twice a week'), which is the opposite instruction. Both bounds are stated because the client named a number, not a range. Matched on the NAME rather than a column: Pune has no sprouts flag and `key_ingredient` files these dishes under the bean (`moth`, `green_moong`) rather than the sprouting, so a column selector would miss them. Scoped to veg_gravy so the sprouts chaat and the sprouts salad — different dishes in different slots — are not counted against a gravy rule. Pune carries SEVEN sprouts gravies and a floor of two a week needs about six distinct across the 20-day cooldown: it fits with one spare, `min` caps itself to what the pool can supply, and `diagnose()` reports a shortfall rather than failing the menu.",
+        "name": "corning_chakan_sprouts_gravy_twice_weekly",
+        "type": "selector_frequency",
+        "base_slot": "veg_gravy",
+        "selector": {
+          "name_contains": [
+            "sprout",
+            "matki"
+          ]
+        },
+        "min": 2,
+        "max_per_week": 2
+      },
+      {
+        "_comment": "'Paneer gravy should be included once a week across all meal sessions.' Exactly one day, so it is a floor as well as a cap — the client asked for the dish, not merely for a limit. Pune carries 18 paneer gravies.",
+        "name": "corning_chakan_paneer_gravy_weekly",
+        "type": "selector_frequency",
+        "base_slot": "veg_gravy",
+        "selector": {
+          "flag": "is_paneer_gravy"
+        },
+        "exact": 1
+      },
+      {
+        "_comment": "'Paneer/kofta preparations should be served once a week across lunch and dinner.' Read together with the rule above: the paneer gravy IS that once-a-week premium dish, and this caps the union so a kofta does not add a second such day. Stated as a cap only, because the floor is already carried by the paneer rule — two exact-1 rules over overlapping families would be a contradiction the moment the solver satisfied both with one dish.",
+        "name": "corning_chakan_paneer_or_kofta_weekly",
+        "type": "selector_frequency",
+        "selector": {
+          "any_of": [
+            {
+              "key_ingredient": "paneer"
+            },
+            {
+              "flag": "is_veg_kofta_gravy"
+            }
+          ]
+        },
+        "max_per_week": 1
+      },
+      {
+        "_comment": "'Mixed-veg, veg kurma and veg kofta gravies should be served maximum twice a week.' The client stated a COMBINED number, so it gets its own rule over the union; Pune's ruleset separately caps each of the three at one day, which is stricter and stays in force. Written out because a future relaxation of a city rule must not silently relax the client's requirement too.",
+        "name": "corning_chakan_mixedveg_kurma_kofta_twice_weekly",
+        "type": "selector_frequency",
+        "base_slot": "veg_gravy",
+        "selector": {
+          "any_flag": [
+            "is_mixedveg_gravy",
+            "is_kurma_gravy",
+            "is_veg_kofta_gravy"
+          ]
+        },
+        "max_per_week": 2
+      },
+      {
+        "_comment": "'Only two leafy-based dishes should be planned per week.' A CAP. This previously also carried `min: 2`, which forced two — a different instruction, and the one the earlier requirement wording ('should be served twice a week') asked for. Overriding Pune's R31 `leafy_veg_dry_weekly` by name rather than adding a second rule, so the two cannot disagree, and R14's `leafy_veg_dry_15d_window` stays disabled above because once per 15 days cannot reach two in a week. NB the old comment here said Pune carries five leafy veg dries; the corrected workbook carries 25, so the pool was never the constraint it warned about. SCOPE: this counts the veg_dry slot only, which is where Pune's rule put it. The client says 'leafy-based dishes', which may mean any slot — `leafy_daily_max_1` already caps one a day across all slots, and widening this needs the client to confirm.",
+        "name": "leafy_veg_dry_weekly",
+        "type": "selector_frequency",
+        "base_slot": "veg_dry",
+        "selector": {
+          "flag": "is_leafy_based_dish"
+        },
+        "max_per_week": 2
+      },
+      {
+        "_comment": "'On Thursday only we will give a starter.' NEEDS A DB CHANGE FIRST: this counter has no `starter` category today, so until one is added the rule is inert and `diagnose()` says so. The restriction stands the station down on the other six days.",
+        "name": "corning_chakan_starter_thursday_only",
+        "type": "slot_day_restriction",
+        "base_slot": "starter",
+        "allowed_weekdays": [
+          "thu"
+        ]
+      },
+      {
+        "_comment": "'Starter should be chat item.' A one-slot composition component IS 'this slot must be a matching dish' (docs/repo_map.md note 20). Pune's starter pool holds four chaats (dhokla, kachori, papadi, samosa) against roughly four Thursdays inside the 20-day cooldown — it fits, with nothing spare, so a fifth chaat in the Pune list would give this rule some slack.",
+        "name": "corning_chakan_starter_is_a_chaat",
+        "type": "slot_composition",
+        "base_slot": "starter",
+        "min_slot_count": 1,
+        "max_slot_count": 1,
+        "components": [
+          {
+            "selector": {
+              "name_contains": [
+                "chaat",
+                "chat"
+              ]
+            },
+            "count": 1
+          }
+        ]
+      },
+      {
+        "_comment": "'Either flavour rice or white rice on a day, not both' — the flavoured-rice slot runs Monday, Tuesday, Thursday, Friday and Sunday. Same shape as Amadeus Pune (and Gartner, Ikea, Stryker NCR): two day-restrictions whose weekday lists are exact COMPLEMENTS, rather than a mutual exclusion between the two slots, so the pair can never both drop and leave a day with no rice at all. Before this both slots ran every day — a real 7-day solve served a flavoured rice AND steamed rice on all seven, which is what the client was reporting. Five flavoured days is the top of the stated 'four to five'. The days are fixed rather than solver-chosen because `white_rice` is a stamped constant, not a candidate the solver picks (src/constants.py CONST_SLOTS), so nothing in the model can trade one against the other. Standing the slot down on Wednesday costs no themed rice: this counter's theme_map makes Wednesday SOUTH, not biryani, and the biryani and khichdi cadences below still have five days to land on.",
+        "name": "corning_chakan_flavour_rice_mon_tue_thu_fri_sun",
+        "type": "slot_day_restriction",
+        "base_slot": "rice",
+        "allowed_weekdays": [
+          "mon",
+          "tue",
+          "thu",
+          "fri",
+          "sun"
+        ]
+      },
+      {
+        "_comment": "The other half: white rice on exactly the two days the flavoured-rice slot stands down. Written as its own weekday list rather than derived from the rule above because a constant slot is stamped AFTER the solve and has no cell to key off — a `slot_day_restriction` on a const slot used to be a silent no-op and the staple appeared every day anyway (menu_solver `_rows_to_week_plan` now honours skip_cells for them). The site serves seven days, so the two lists must union to all seven or a day comes out with no rice at all; if the flavoured-rice days change, this list changes with them.",
+        "name": "corning_chakan_white_rice_wed_sat",
+        "type": "slot_day_restriction",
+        "base_slot": "white_rice",
+        "allowed_weekdays": [
+          "wed",
+          "sat"
+        ]
+      },
+      {
+        "_comment": "'Biryani should be served maximum once in 15 days.' Pune's `mixedveg_pulao_biryani_weekly` caps the mixed-veg pulao/biryani family at one day a WEEK, which permits two inside any 15 days. This is the half that looks BACKWARDS, and it reads saved history rather than only the week being solved, so a plan starting the day after a biryani still waits. SELECTED BY NAME AS WELL AS FLAG, and the flag alone would have made this rule nearly inert: `is_biryani_item` is set on 3 of the 15 biryanis in Pune's rice pool, and a first version of this rule using the flag alone let a real week serve kolakata_stye_aloo_biryani on the Thursday and mughalai_veg_biryani on the Saturday while reporting zero. The missing flags are a dataset matter for the list's owner; the name carries the rule until they are set. `biryani_rice` is included deliberately — for a cap, counting an ambiguous dish costs a day of variety, missing one costs the rule. Paired with `corning_chakan_biryani_weekly` below, because this rule alone does not bind inside the week being solved: with it in place and no saved history, a real week served a biryani on the Thursday AND the Saturday. Pune uses the same pair for kadhi (`kadhi_weekly` + `kadhi_15d_window`) for exactly this reason.",
+        "name": "corning_chakan_biryani_15d_window",
+        "type": "selector_history_window",
+        "base_slot": "rice",
+        "selector": {
+          "any_of": [
+            {
+              "flag": "is_biryani_item"
+            },
+            {
+              "name_contains": [
+                "biryani",
+                "biriyani"
+              ]
+            }
+          ]
+        },
+        "window_days": 15
+      },
+      {
+        "_comment": "The forward half of 'biryani maximum once in 15 days': one biryani in the week being solved. The 15-day window above cannot see the week it is planning, only what was saved before it, so without this a single plan can hold two. Same selector as the window, deliberately — two halves of one requirement must not be able to disagree about what a biryani is. Pune's `mixedveg_pulao_biryani_weekly` stays in force and is stricter on the mixed-veg pulao family it names.",
+        "name": "corning_chakan_biryani_weekly",
+        "type": "selector_frequency",
+        "base_slot": "rice",
+        "selector": {
+          "any_of": [
+            {
+              "flag": "is_biryani_item"
+            },
+            {
+              "name_contains": [
+                "biryani",
+                "biriyani"
+              ]
+            }
+          ]
+        },
+        "max_per_week": 1
+      },
+      {
+        "_comment": "'Khichdi once in fifteen days' is a CADENCE, so this rule is both halves. The ceiling is the 15-day backward window: no second khichdi inside fifteen days of a saved one. The floor is `at_least_once_per_window`: once the family has not been served for 15 days, the plan must serve one. The ceiling alone is satisfied by serving NONE — the sprouts-gravy defect of v2.07.01, a cap written where a floor was asked for, which reads as enforced and is not. Selected by sub_category, not by name: all seven khichdis in the Pune list are `north_khichdi` (dal_khichdi, masala_khichadi, moogdal_khichadi, moong_khichadi, palak_bajra_khichdi, khandeshi_khichadi, sweet_rice_pulao_khichadi) and the spelling runs khichdi / khichadi / khicha across them, so a name match would need three needles and would still miss the next one added. `is_liquid_rice` is set on one of the seven and is not the family. THE GUARANTEED GAP IS 15 DAYS PLUS THE HORIZON MINUS ONE (21 on a 7-day plan): the floor says 'somewhere in this plan', not 'on this date', because pinning the date would fix khichdi to one weekday for ever. The floor stands down, saying so, on a horizon where every khichdi is banned by the item cooldown.",
+        "name": "corning_chakan_khichdi_15d_window",
+        "type": "selector_history_window",
+        "base_slot": "rice",
+        "selector": {
+          "sub_category": "north_khichdi"
+        },
+        "window_days": 15,
+        "at_least_once_per_window": true
+      },
+      {
+        "_comment": "The forward half of 'khichdi once in fifteen days': at most one in the week being solved. Same selector as the window above, deliberately — two halves of one requirement must not be able to disagree about what a khichdi is.",
+        "name": "corning_chakan_khichdi_weekly",
+        "type": "selector_frequency",
+        "base_slot": "rice",
+        "selector": {
+          "sub_category": "north_khichdi"
+        },
+        "max_per_week": 1
+      }
+    ],
+    "constant_items": {
+      "_comment": "'Indian Bread staple only Chapati' — the same dish every day, which is what this fleet's rulebooks mean by a staple ('like white rice and pickle'). A pin, not a rule: a `slot_composition` or a `repeatable_items` on the chapati FAMILY would let the slot rotate between plain, palak, carrot and beetroot chapati, which is a variety rule where the client asked for one bread. Pinned to `chapati`, which is a real Pune row; `phulka` is the other dish Pune's R36 staple exemption names and it is not pinned, so the pin alone decides. Same shape as ICON Chn, DXC, SAEL and Corning NCR.",
+      "bread": "chapati"
+    }
+  }
+}

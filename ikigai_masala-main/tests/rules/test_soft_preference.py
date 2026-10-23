@@ -1,0 +1,567 @@
+"""Tests for SoftPreferenceRule (Phase-4 soft-rule framework).
+
+Config validation plus CP-SAT behaviour: with the penalty in the objective the
+solver must prefer the arrangement the rule encodes (premiums apart, no
+consecutive regional repeat, varied attribute). Soft rules never constrain
+feasibility, so these assert *preference*, not hard bans.
+"""
+
+import datetime as dt
+
+import pandas as pd
+from ortools.sat.python import cp_model
+
+from src.menu_rules.soft_preference_rule import SoftPreferenceRule
+from src.menu_rules.base_menu_rule import MenuRuleType, MenuRuleSeverity
+
+
+class _FakeCell:
+    def __init__(self, d_idx, base_slot, rows, x_vars):
+        self.d_idx = d_idx
+        self.date = dt.date(2026, 3, 23) + dt.timedelta(days=d_idx)
+        self.slot_id = f'{base_slot}__1'
+        self.base_slot = base_slot
+        self.cand_rows = rows
+        self.x_vars = x_vars
+
+
+def _link_any(model, lits, y):
+    if not lits:
+        model.Add(y == 0)
+        return
+    model.Add(sum(lits) >= y)
+    for lit in lits:
+        model.Add(lit <= y)
+
+
+def _cell(model, di, base_slot, items):
+    rows = [pd.Series({'item': f'{base_slot}_{di}_{i}', **it}) for i, it in enumerate(items)]
+    xs = [model.NewBoolVar(f'x_{di}_{base_slot}_{i}') for i in range(len(items))]
+    model.Add(sum(xs) == 1)
+    return _FakeCell(di, base_slot, rows, xs)
+
+
+def _ctx(cells, n_days):
+    return {
+        'cells': cells,
+        'dates': [dt.date(2026, 3, 23) + dt.timedelta(days=i) for i in range(n_days)],
+        'link_any_fn': _link_any,
+    }
+
+
+def _maximize(model, terms):
+    model.Maximize(sum(terms))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 5
+    return solver, solver.Solve(model)
+
+
+class TestConfig:
+    def test_type_and_severity(self):
+        r = SoftPreferenceRule({'name': 'x', 'mode': 'avoid_consecutive',
+                                'base_slot': 'rice', 'selector': {'flag': 'f'}})
+        assert r.rule_type == MenuRuleType.SOFT_PREFERENCE
+        assert r.severity == MenuRuleSeverity.SOFT
+        assert r.validate_config()
+
+    def test_bad_mode(self):
+        assert not SoftPreferenceRule({'name': 'x', 'mode': 'nope'}).validate_config()
+
+    def test_different_day_needs_both_selectors(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'different_day',
+            'selector_a': {'flag': 'a'}}).validate_config()
+
+    def test_avoid_consecutive_needs_selector(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'avoid_consecutive', 'base_slot': 'rice'}).validate_config()
+
+    def test_attr_repeat_needs_group_by(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'avoid_attribute_repeat', 'base_slot': 'veg_gravy'}).validate_config()
+
+    def test_negative_weight_rejected(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'avoid_consecutive', 'selector': {'flag': 'f'},
+            'weight': -1}).validate_config()
+
+    def test_bad_priority_rejected(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'avoid_consecutive', 'selector': {'flag': 'f'},
+            'priority': 'urgent'}).validate_config()
+
+    def test_priority_maps_to_tier_weight(self):
+        from src.constants import OBJECTIVE_TIER_WEIGHTS
+        for pri in ('high', 'medium', 'low'):
+            r = SoftPreferenceRule({'name': 'x', 'mode': 'avoid_consecutive',
+                                    'selector': {'flag': 'f'}, 'priority': pri})
+            assert r.weight == OBJECTIVE_TIER_WEIGHTS[pri]
+        # explicit weight overrides the tier
+        r = SoftPreferenceRule({'name': 'x', 'mode': 'avoid_consecutive',
+                                'selector': {'flag': 'f'}, 'priority': 'high', 'weight': 5})
+        assert r.weight == 5
+
+    def test_apply_is_noop(self):
+        # objective-only rule: apply must be safe and do nothing
+        SoftPreferenceRule({'name': 'x', 'mode': 'avoid_consecutive',
+                            'selector': {'flag': 'f'}}).apply(None, {}, None, {})
+
+
+class TestBehaviour:
+    def test_premiums_pushed_to_different_days(self):
+        model = cp_model.CpModel()
+        # exactly one premium gravy and one premium dry across 2 days; solver
+        # chooses which day each lands on.
+        g0 = _cell(model, 0, 'veg_gravy', [{'is_premium_gravy': 1}, {'is_premium_gravy': 0}])
+        g1 = _cell(model, 1, 'veg_gravy', [{'is_premium_gravy': 1}, {'is_premium_gravy': 0}])
+        d0 = _cell(model, 0, 'veg_dry', [{'is_premium_veg_dry': 1}, {'is_premium_veg_dry': 0}])
+        d1 = _cell(model, 1, 'veg_dry', [{'is_premium_veg_dry': 1}, {'is_premium_veg_dry': 0}])
+        model.Add(g0.x_vars[0] + g1.x_vars[0] == 1)   # one premium gravy in the week
+        model.Add(d0.x_vars[0] + d1.x_vars[0] == 1)   # one premium dry in the week
+        rule = SoftPreferenceRule({
+            'name': 'prem', 'mode': 'different_day', 'weight': 1000,
+            'selector_a': {'flag': 'is_premium_gravy'}, 'base_slot_a': 'veg_gravy',
+            'selector_b': {'flag': 'is_premium_veg_dry'}, 'base_slot_b': 'veg_dry'})
+        terms = rule.get_objective_terms(model, _ctx([g0, g1, d0, d1], 2))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        gravy_day = 0 if solver.Value(g0.x_vars[0]) else 1
+        dry_day = 0 if solver.Value(d0.x_vars[0]) else 1
+        assert gravy_day != dry_day
+
+    def test_avoid_consecutive_regional_rice(self):
+        model = cp_model.CpModel()
+        # day0 rice can only be north; day1 may be north or south.
+        r0 = _cell(model, 0, 'rice', [{'cuisine_family': 'north_indian'}])
+        r1 = _cell(model, 1, 'rice',
+                   [{'cuisine_family': 'north_indian'}, {'cuisine_family': 'south_indian'}])
+        rule = SoftPreferenceRule({
+            'name': 'nc', 'mode': 'avoid_consecutive', 'weight': 1000,
+            'base_slot': 'rice', 'selector': {'cuisine_family': 'north_indian'}})
+        terms = rule.get_objective_terms(model, _ctx([r0, r1], 2))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(r1.x_vars[1]) == 1   # day1 picks south to break the run
+
+    def test_high_priority_wins_over_medium(self):
+        # 3 days of rice; day1 is the only free choice. Picking north on day1
+        # makes north consecutive (violates the HIGH rule); picking south makes
+        # south consecutive (violates the MEDIUM rule). Lexicographic tiers must
+        # make the solver sacrifice the medium rule to protect the high one.
+        model = cp_model.CpModel()
+        r0 = _cell(model, 0, 'rice', [{'cuisine_family': 'north_indian'}])
+        r1 = _cell(model, 1, 'rice',
+                   [{'cuisine_family': 'north_indian'}, {'cuisine_family': 'south_indian'}])
+        r2 = _cell(model, 2, 'rice', [{'cuisine_family': 'south_indian'}])
+        cells = [r0, r1, r2]
+        high = SoftPreferenceRule({
+            'name': 'hi', 'mode': 'avoid_consecutive', 'priority': 'high',
+            'base_slot': 'rice', 'selector': {'cuisine_family': 'north_indian'}})
+        med = SoftPreferenceRule({
+            'name': 'md', 'mode': 'avoid_consecutive', 'priority': 'medium',
+            'base_slot': 'rice', 'selector': {'cuisine_family': 'south_indian'}})
+        ctx = _ctx(cells, 3)
+        terms = high.get_objective_terms(model, ctx) + med.get_objective_terms(model, ctx)
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        # day1 goes south: the high (north) rule is protected at the medium
+        # rule's expense.
+        assert solver.Value(r1.x_vars[1]) == 1
+
+    def test_avoid_attribute_repeat_varies_key_ingredient(self):
+        model = cp_model.CpModel()
+        v0 = _cell(model, 0, 'veg_gravy', [{'key_ingredient': 'potato'}])
+        v1 = _cell(model, 1, 'veg_gravy',
+                   [{'key_ingredient': 'potato'}, {'key_ingredient': 'tomato'}])
+        rule = SoftPreferenceRule({
+            'name': 'var', 'mode': 'avoid_attribute_repeat', 'weight': 1000,
+            'base_slot': 'veg_gravy', 'group_by': 'key_ingredient'})
+        terms = rule.get_objective_terms(model, _ctx([v0, v1], 2))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(v1.x_vars[1]) == 1   # day1 picks tomato, not another potato
+
+
+class TestPreferDayTypes:
+    """`prefer_day_types` — the selector belongs on these themes; other days are
+    penalised, not forbidden.
+
+    The hard equivalent is `selector_frequency.allowed_day_types`, and it would
+    forbid the dish outright — a counter themed chinese every weekday would then
+    never serve paneer at all. The client's ask is "prefer mix/south/north, fall
+    back to the others", so the others must stay legal.
+    """
+
+    def _ctx_with_themes(self, cells, themes):
+        ctx = _ctx(cells, len(themes))
+        ctx['day_types'] = list(themes)
+        return ctx
+
+    def test_requires_selector_and_day_types(self):
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'prefer_day_types',
+            'day_types': ['north']}).validate_config()
+        assert not SoftPreferenceRule({
+            'name': 'x', 'mode': 'prefer_day_types',
+            'selector': {'key_ingredient': 'paneer'}}).validate_config()
+        rule = SoftPreferenceRule({
+            'name': 'x', 'mode': 'prefer_day_types',
+            'selector': {'key_ingredient': 'paneer'}, 'day_types': ['north']})
+        assert rule.validate_config(), rule.validation_errors()
+
+    def test_day_types_are_case_insensitive(self):
+        rule = SoftPreferenceRule({
+            'name': 'x', 'mode': 'prefer_day_types',
+            'selector': {'key_ingredient': 'paneer'},
+            'day_types': ['MIX', ' South ', 'north']})
+        assert rule.day_types == {'mix', 'south', 'north'}
+
+    def test_paneer_moves_onto_a_preferred_day(self):
+        """Two days, one paneer to place: it must land on the north day, not the
+        biryani day."""
+        model = cp_model.CpModel()
+        # Each day's gravy is paneer or not; exactly one paneer across the two.
+        d0 = _cell(model, 0, 'veg_gravy',
+                   [{'key_ingredient': 'paneer'}, {'key_ingredient': 'potato'}])
+        d1 = _cell(model, 1, 'veg_gravy',
+                   [{'key_ingredient': 'paneer'}, {'key_ingredient': 'potato'}])
+        model.Add(d0.x_vars[0] + d1.x_vars[0] == 1)
+        rule = SoftPreferenceRule({
+            'name': 'pref', 'mode': 'prefer_day_types', 'weight': 1000,
+            'base_slot': 'veg_gravy', 'selector': {'key_ingredient': 'paneer'},
+            'day_types': ['mix', 'south', 'north']})
+        ctx = self._ctx_with_themes([d0, d1], ['biryani', 'north'])
+        solver, status = _maximize(model, rule.get_objective_terms(model, ctx))
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(d1.x_vars[0]) == 1, "paneer should be on the north day"
+        assert solver.Value(d0.x_vars[0]) == 0
+
+    def test_off_theme_is_allowed_when_it_is_the_only_option(self):
+        """Soft, not hard: with every day off-theme the dish still gets placed."""
+        model = cp_model.CpModel()
+        d0 = _cell(model, 0, 'veg_gravy', [{'key_ingredient': 'paneer'}])
+        rule = SoftPreferenceRule({
+            'name': 'pref', 'mode': 'prefer_day_types', 'weight': 1000,
+            'base_slot': 'veg_gravy', 'selector': {'key_ingredient': 'paneer'},
+            'day_types': ['mix', 'south', 'north']})
+        ctx = self._ctx_with_themes([d0], ['chinese'])
+        terms = rule.get_objective_terms(model, ctx)
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(d0.x_vars[0]) == 1
+        assert terms, "an off-theme day must contribute a penalty term"
+
+    def test_no_penalty_term_when_every_day_is_preferred(self):
+        model = cp_model.CpModel()
+        d0 = _cell(model, 0, 'veg_gravy', [{'key_ingredient': 'paneer'}])
+        rule = SoftPreferenceRule({
+            'name': 'pref', 'mode': 'prefer_day_types',
+            'base_slot': 'veg_gravy', 'selector': {'key_ingredient': 'paneer'},
+            'day_types': ['north']})
+        ctx = self._ctx_with_themes([d0], ['north'])
+        assert rule.get_objective_terms(model, ctx) == []
+
+
+class TestMatchAttribute:
+    """`match_attribute` — two slots should agree on one attribute.
+
+    Citrix: "if veg gravy is north then veg dry should be north" and "flavoured
+    rice and veg gravy should be of the same region". SOFT because the client's
+    own instruction was "if I give south I can use north fallback" — so a south
+    rice pulls a south gravy when one is free and falls back to north rather
+    than failing.
+    """
+
+    _REGIONS = ['north_indian', 'south_indian']
+
+    def _rule(self, **over):
+        cfg = {
+            'name': 'region', 'mode': 'match_attribute', 'weight': 1000,
+            'group_by': 'cuisine_family', 'values': list(self._REGIONS),
+            'base_slot_a': 'rice', 'base_slot_b': 'veg_gravy',
+        }
+        cfg.update(over)
+        return SoftPreferenceRule(cfg)
+
+    # ----- config -----
+
+    def test_valid_config(self):
+        r = self._rule()
+        assert r.validate_config(), r.validation_errors()
+        assert r.rule_type == MenuRuleType.SOFT_PREFERENCE
+        assert r.severity == MenuRuleSeverity.SOFT
+
+    def test_requires_group_by(self):
+        r = self._rule(group_by=None)
+        assert not r.validate_config()
+        assert any('group_by' in e for e in r.validation_errors())
+
+    def test_requires_both_slots(self):
+        assert not self._rule(base_slot_b=None).validate_config()
+        assert not self._rule(base_slot_a=None).validate_config()
+
+    def test_rejects_the_same_slot_on_both_sides(self):
+        # One slot matching itself penalises nothing; the inverse of that ask is
+        # avoid_attribute_repeat, so a config saying this is a mistake.
+        r = self._rule(base_slot_b='rice')
+        assert not r.validate_config()
+        assert any('two different slots' in e for e in r.validation_errors())
+
+    def test_requires_at_least_two_values(self):
+        assert not self._rule(values=['north_indian']).validate_config()
+        assert not self._rule(values=None).validate_config()
+
+    def test_values_are_normalised(self):
+        # Normalised exactly as the column itself is (`_norm_str`: strip +
+        # lowercase, nothing else), so the two sides of the comparison agree.
+        r = self._rule(values=[' North_Indian ', 'SOUTH_INDIAN'])
+        assert r.values == ['north_indian', 'south_indian']
+
+    def test_a_value_is_matched_case_insensitively_against_the_column(self):
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'South_Indian'}])
+        gravy = _cell(model, 0, 'veg_gravy',
+                      [{'cuisine_family': 'NORTH_INDIAN'},
+                       {'cuisine_family': 'south_indian '}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(gravy.x_vars[1]) == 1
+
+    # ----- behaviour -----
+
+    def _ctx2(self, cells, n=2):
+        return _ctx(cells, n)
+
+    def test_gravy_follows_a_south_rice(self):
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'south_indian'}])
+        gravy = _cell(model, 0, 'veg_gravy',
+                      [{'cuisine_family': 'north_indian'},
+                       {'cuisine_family': 'south_indian'}])
+        rule = self._rule()
+        terms = rule.get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(gravy.x_vars[1]) == 1, "south rice must pull a south gravy"
+
+    def test_gravy_follows_a_north_rice(self):
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'north_indian'}])
+        gravy = _cell(model, 0, 'veg_gravy',
+                      [{'cuisine_family': 'north_indian'},
+                       {'cuisine_family': 'south_indian'}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(gravy.x_vars[0]) == 1
+
+    def test_north_fallback_when_no_south_gravy_exists(self):
+        """The client's own wording: "if I give south I can use north fallback"
+        — soft, so a day whose gravy pool is north-only still solves."""
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'south_indian'}])
+        gravy = _cell(model, 0, 'veg_gravy', [{'cuisine_family': 'north_indian'}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(gravy.x_vars[0]) == 1
+        assert solver.Value(rice.x_vars[0]) == 1
+
+    def test_rice_moves_when_the_gravy_is_the_fixed_side(self):
+        """Symmetric: neither slot is the declared driver, so whichever has the
+        freer pool is the one that moves."""
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice',
+                     [{'cuisine_family': 'north_indian'},
+                      {'cuisine_family': 'south_indian'}])
+        gravy = _cell(model, 0, 'veg_gravy', [{'cuisine_family': 'south_indian'}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.Value(rice.x_vars[1]) == 1
+
+    def test_an_unlisted_cuisine_on_one_side_is_left_alone(self):
+        """A Chinese day carries none of the listed values, so the rule says
+        nothing — without the guard it would penalise every listed value on the
+        other side and push the gravy off north AND south entirely."""
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'chinese'}])
+        gravy = _cell(model, 0, 'veg_gravy',
+                      [{'cuisine_family': 'north_indian'},
+                       {'cuisine_family': 'south_indian'}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        assert terms == []
+
+    def test_a_multi_cell_slot_serving_both_regions_matches_either(self):
+        """`veg_dry_north_south_pair` mandates one north + one south veg dry. A
+        north gravy beside that pair IS matched — the rule asks "is my value
+        present on the other side", not "are the two values equal", so it does
+        not fight the composition."""
+        model = cp_model.CpModel()
+        gravy = _cell(model, 0, 'veg_gravy', [{'cuisine_family': 'north_indian'}])
+        dry_n = _cell(model, 0, 'veg_dry', [{'cuisine_family': 'north_indian'}])
+        dry_s = _cell(model, 0, 'veg_dry', [{'cuisine_family': 'south_indian'}])
+        rule = self._rule(base_slot_a='veg_gravy', base_slot_b='veg_dry')
+        terms = rule.get_objective_terms(model, self._ctx2([gravy, dry_n, dry_s], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        # The gravy's region is present in the veg_dry pair, so that direction
+        # costs nothing; only the unmatched south dry is penalised.
+        assert solver.ObjectiveValue() == -1000
+
+    def test_a_matched_day_costs_nothing(self):
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'south_indian'}])
+        gravy = _cell(model, 0, 'veg_gravy', [{'cuisine_family': 'south_indian'}])
+        terms = self._rule().get_objective_terms(model, self._ctx2([rice, gravy], 1))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.ObjectiveValue() == 0
+
+    def test_selector_narrows_which_dishes_participate(self):
+        """`selector_a`/`selector_b` are optional extra narrowing: only the
+        flavoured rices should be compared, not a plain steamed one."""
+        model = cp_model.CpModel()
+        rice = _cell(model, 0, 'rice', [{'cuisine_family': 'south_indian',
+                                        'is_flavoured': 0}])
+        gravy = _cell(model, 0, 'veg_gravy',
+                      [{'cuisine_family': 'north_indian'},
+                       {'cuisine_family': 'south_indian'}])
+        rule = self._rule(selector_a={'flag': 'is_flavoured'})
+        # The one rice candidate is filtered out, so there is nothing to match.
+        assert rule.get_objective_terms(model, self._ctx2([rice, gravy], 1)) == []
+
+    def test_each_day_is_scored_independently(self):
+        model = cp_model.CpModel()
+        cells = []
+        for di, region in enumerate(('south_indian', 'north_indian')):
+            cells.append(_cell(model, di, 'rice', [{'cuisine_family': region}]))
+            cells.append(_cell(model, di, 'veg_gravy',
+                               [{'cuisine_family': 'north_indian'},
+                                {'cuisine_family': 'south_indian'}]))
+        terms = self._rule().get_objective_terms(model, self._ctx2(cells, 2))
+        solver, status = _maximize(model, terms)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        assert solver.ObjectiveValue() == 0
+        assert solver.Value(cells[1].x_vars[1]) == 1   # day0 gravy south
+        assert solver.Value(cells[3].x_vars[0]) == 1   # day1 gravy north
+
+
+class TestBaseSlotListNormalisation:
+    """A LIST base_slot used to fall through to the single-name branch, where
+    `c.base_slot != ['a', 'b']` is always true — so the rule matched nothing and
+    went silently inert, the same failure class as the bread cuisine lock."""
+
+    def test_different_day_accepts_a_list_of_slots(self):
+        model = cp_model.CpModel()
+        a = _cell(model, 0, 'veg_gravy', [{'flag_a': 1}])
+        b = _cell(model, 0, 'veg_dry', [{'flag_b': 1}])
+        rule = SoftPreferenceRule({
+            'name': 'x', 'mode': 'different_day', 'weight': 1000,
+            'selector_a': {'flag': 'flag_a'}, 'base_slot_a': ['veg_gravy', 'rice'],
+            'selector_b': {'flag': 'flag_b'}, 'base_slot_b': ['veg_dry']})
+        terms = rule.get_objective_terms(model, _ctx([a, b], 1))
+        assert terms, "a list base_slot_a must still match its slots"
+
+    def test_a_string_base_slot_is_unchanged(self):
+        r = SoftPreferenceRule({'name': 'x', 'mode': 'avoid_consecutive',
+                                'base_slot': 'rice', 'selector': {'flag': 'f'}})
+        assert r.base_slot == 'rice'
+        assert r.base_slots == {'rice'}
+
+
+class TestPreferCells:
+    """The per-cell twin of `prefer_daily`, and why it is a separate mode.
+
+    `prefer_daily` scores a DAY — one penalty if the selector is absent from
+    the whole plate. That is right for "a protein somewhere on the plate" and
+    useless for "make this day Tamil", because the moment one matching dish
+    lands the penalty is zero and the other four cells are unscored. Pairing it
+    with a hard floor of 3 over 5 slots therefore came back with exactly 3
+    every time, which is the defect this mode exists for and the first test
+    below pins.
+    """
+
+    def _five_cells(self, model, di=0):
+        """Five slots, each offering one matching and one non-matching dish."""
+        cells = []
+        for slot in ('veg_gravy', 'veg_dry', 'dal', 'nonveg_main', 'dessert'):
+            cells.append(_cell(model, di, slot, [{'f': 1}, {'f': 0}]))
+        return cells
+
+    def _picked(self, mode):
+        model = cp_model.CpModel()
+        cells = self._five_cells(model)
+        rule = SoftPreferenceRule({
+            'name': 'x', 'mode': mode, 'weight': 1_000_000,
+            'selector': {'flag': 'f'},
+            'base_slot': ['veg_gravy', 'veg_dry', 'dal', 'nonveg_main',
+                          'dessert']})
+        ctx = _ctx(cells, 1)
+        terms = rule.get_objective_terms(model, ctx) or []
+        # Every NON-matching dish is worth 1, so the preference has to earn
+        # each cell rather than getting it by default.
+        nudge = [c.x_vars[1] for c in cells]
+        _, status = _maximize(model, list(terms) + nudge)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 5
+        model.Maximize(sum(list(terms) + nudge))
+        solver.Solve(model)
+        return sum(1 for c in cells if solver.Value(c.x_vars[0]))
+
+    def test_prefer_daily_only_ever_buys_one_cell(self):
+        """Pinned as the limitation, not as a bug: `prefer_daily` is correct
+        for what it is for. This is why it could not be reused."""
+        assert self._picked('prefer_daily') == 1
+
+    def test_prefer_cells_takes_every_cell_it_can(self):
+        assert self._picked('prefer_cells') == 5
+
+    def test_it_requires_a_selector(self):
+        assert not SoftPreferenceRule(
+            {'name': 'x', 'mode': 'prefer_cells'}).validate_config()
+
+    def test_a_cell_with_no_matching_candidate_is_not_scored(self):
+        """A cell that COULD not carry the selector is a constant the solver
+        cannot act on, and scoring it would drown the cells it can."""
+        model = cp_model.CpModel()
+        cells = [_cell(model, 0, 'veg_gravy', [{'f': 0}, {'f': 0}])]
+        rule = SoftPreferenceRule({
+            'name': 'x', 'mode': 'prefer_cells', 'selector': {'flag': 'f'},
+            'base_slot': ['veg_gravy']})
+        assert rule.get_objective_terms(model, _ctx(cells, 1)) == []
+
+    def _two_day_picks(self, only_on_dates):
+        """Solve two days and report which took the matching dish.
+
+        Asserted through the SOLUTION rather than by inspecting the objective
+        expression: the term is one opaque CP-SAT object either way, and what
+        the scope has to change is the menu.
+        """
+        model = cp_model.CpModel()
+        cells = self._five_cells(model, 0) + self._five_cells(model, 1)
+        ctx = _ctx(cells, 2)
+        cfg = {'name': 'a', 'mode': 'prefer_cells', 'weight': 1_000_000,
+               'selector': {'flag': 'f'}, 'base_slot': ['veg_gravy']}
+        if only_on_dates is not None:
+            cfg['only_on_dates'] = [ctx['dates'][i].isoformat()
+                                    for i in only_on_dates]
+        terms = SoftPreferenceRule(cfg).get_objective_terms(model, ctx) or []
+        nudge = [c.x_vars[1] for c in cells]        # prefer the NON-matching
+        model.Maximize(sum(list(terms) + nudge))
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 5
+        solver.Solve(model)
+        return [
+            any(solver.Value(c.x_vars[0])
+                for c in cells if c.d_idx == di and c.base_slot == 'veg_gravy')
+            for di in (0, 1)
+        ]
+
+    def test_unscoped_it_takes_both_days(self):
+        assert self._two_day_picks(None) == [True, True]
+
+    def test_only_on_dates_leaves_the_other_day_alone(self):
+        assert self._two_day_picks([0]) == [True, False]

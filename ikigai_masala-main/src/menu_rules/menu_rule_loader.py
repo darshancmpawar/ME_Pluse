@@ -1,0 +1,656 @@
+"""
+Menu rule loader from JSON configuration.
+"""
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Per-client rules file. Resolved relative to the repo (data/configs) so that
+# importing ``src.menu_rules`` never depends on the ``api`` package — the
+# ``CLIENT_RULES_CONFIG_PATH`` env var still overrides it. Kept module-level so
+# tests can monkeypatch this name.
+CLIENT_RULES_CONFIG_PATH = os.getenv(
+    'CLIENT_RULES_CONFIG_PATH',
+    str(Path(__file__).resolve().parent.parent.parent / 'data' / 'configs' / 'client_rules.json'),
+)
+
+# Directory holding ONE file per client (``<slug>.json``), each a single
+# ``{"<client name>": {disable, rules, constant_items, …}}``. This is the source
+# of truth; ``CLIENT_RULES_CONFIG_PATH`` above is the legacy single document and
+# is read only when this directory is missing or empty, so a deployment that has
+# not taken the split keeps working. The single file grew to 2,453 lines across
+# 36 clients, which made every client edit touch the same document.
+CLIENT_RULES_DIR = os.getenv(
+    'CLIENT_RULES_DIR',
+    str(Path(__file__).resolve().parent.parent.parent / 'customisation' / 'client rules'),
+)
+
+# Directory holding one rules file per city (``<city>.json``). A city file may
+# ``"extends"`` another city (by bare name) to inherit its rules and override
+# by rule ``name``; ``DEFAULT_CITY`` is the reference ruleset and the fallback
+# for any city without its own file.
+CITY_RULES_DIR = os.getenv(
+    'CITY_RULES_DIR',
+    str(Path(__file__).resolve().parent.parent.parent / 'data' / 'configs' / 'city_rules'),
+)
+DEFAULT_CITY = 'bangalore'
+
+# The shared rule library — reusable components a client references by name
+# instead of restating the body. "Paneer once a week" was copy-pasted verbatim
+# into ELEVEN client files before this existed; each copy was a place the
+# wording could drift and a fix to one was a fix to one.
+RULE_LIBRARY_PATH = os.getenv(
+    'RULE_LIBRARY_PATH',
+    str(Path(__file__).resolve().parent.parent.parent / 'data' / 'configs' / 'rule_library.json'),
+)
+
+from .base_menu_rule import BaseMenuRule
+from .cuisine_menu_rule import CuisineMenuRule
+from .unique_items_menu_rule import UniqueItemsMenuRule
+from .coupling_menu_rule import CouplingMenuRule
+from .curd_side_menu_rule import CurdSideMenuRule
+from .premium_menu_rule import PremiumMenuRule
+from .theme_rules import (
+    ThemeDayMenuRule,
+    ThemeSlotFilterRule,
+    ThemeStarterPreferenceRule,
+    ThemeFallbackPenaltyRule,
+)
+from .color_rules import (
+    ColorPairingMenuRule,
+    ColorVarietyMenuRule,
+    WelcomeDrinkColorMenuRule,
+)
+from .cooldown_rules import (
+    ItemCooldownMenuRule,
+    RiceBreadGapMenuRule,
+    WeekSignatureCooldownMenuRule,
+)
+from .nonveg_rules import (
+    NonvegBiryaniWeeklyRule,
+    NonvegDryPreferenceRule,
+)
+from .ingredient_ban_rule import IngredientBanRule
+from .seasonal_ban_rule import SeasonalBanRule
+from .selector_frequency_rule import SelectorFrequencyRule
+from .selector_history_window_rule import SelectorHistoryWindowRule
+from .attribute_grouping_rule import AttributeGroupingRule
+from .soft_preference_rule import SoftPreferenceRule
+from .slot_composition_rule import SlotCompositionRule
+from .slot_day_restriction_rule import SlotDayRestrictionRule
+from .fixed_daily_item_rule import FixedDailyItemRule
+from .repeatable_items_rule import RepeatableItemsRule
+from .same_day_exclusion_rule import SameDayExclusionRule
+from .welcome_drink_buttermilk_rule import WelcomeDrinkButtermilkRule
+
+
+def _log_invalid_rule(
+    rule: Optional[BaseMenuRule],
+    rule_config: Dict[str, Any],
+    *,
+    scope: str,
+) -> None:
+    """Log an invalid rule with its name, type, and any reasons provided
+    by the rule's ``validation_errors()`` hook. A generic "invalid" message
+    stranded admins with no way to know which field was wrong.
+    """
+    name = rule_config.get('name') or (rule.name if rule else '<unnamed>')
+    rule_type = rule_config.get('type', '?')
+    errs = rule.validation_errors() if rule is not None else []
+    if errs:
+        logger.warning(
+            "Skipping invalid %s '%s' (type=%s): %s",
+            scope, name, rule_type, "; ".join(errs),
+        )
+    else:
+        logger.warning(
+            "Skipping invalid %s '%s' (type=%s): validate_config() returned False",
+            scope, name, rule_type,
+        )
+
+
+class MenuRuleLoader:
+    """Loads menu rules from JSON configuration files."""
+
+    RULE_CLASSES = {
+        'cuisine': CuisineMenuRule,
+        'color_pairing': ColorPairingMenuRule,
+        'color_variety': ColorVarietyMenuRule,
+        'unique_items': UniqueItemsMenuRule,
+        'theme_day': ThemeDayMenuRule,
+        'coupling': CouplingMenuRule,
+        'curd_side': CurdSideMenuRule,
+        'premium': PremiumMenuRule,
+        'welcome_drink_color': WelcomeDrinkColorMenuRule,
+        'welcome_drink_buttermilk': WelcomeDrinkButtermilkRule,
+        'week_signature_cooldown': WeekSignatureCooldownMenuRule,
+        'theme_starter_preference': ThemeStarterPreferenceRule,
+        'theme_fallback_penalty': ThemeFallbackPenaltyRule,
+        'item_cooldown': ItemCooldownMenuRule,
+        'ricebread_gap': RiceBreadGapMenuRule,
+        'theme_slot_filter': ThemeSlotFilterRule,
+        'nonveg_dry_preference': NonvegDryPreferenceRule,
+        'nonveg_biryani_weekly': NonvegBiryaniWeeklyRule,
+        'ingredient_ban': IngredientBanRule,
+        'seasonal_ban': SeasonalBanRule,
+        'selector_frequency': SelectorFrequencyRule,
+        'selector_history_window': SelectorHistoryWindowRule,
+        'attribute_grouping': AttributeGroupingRule,
+        'soft_preference': SoftPreferenceRule,
+        'slot_composition': SlotCompositionRule,
+        'slot_day_restriction': SlotDayRestrictionRule,
+        'fixed_daily_item': FixedDailyItemRule,
+        'repeatable_items': RepeatableItemsRule,
+        'same_day_exclusion': SameDayExclusionRule,
+    }
+
+    def __init__(self, config_path: Optional[str] = None):
+        self.config_path = Path(config_path) if config_path else None
+        self.rules = []
+
+    def load_from_file(self, config_path: str = None) -> List[BaseMenuRule]:
+        if config_path:
+            self.config_path = Path(config_path)
+        if not self.config_path or not self.config_path.exists():
+            raise FileNotFoundError(f"Menu rule config file not found: {self.config_path}")
+        # Resolve any ``extends`` chain into a single merged rule list, then
+        # deserialize once.
+        merged = self._resolve_rule_dicts(self.config_path, seen=set())
+        return self.load_from_dict({'rules': merged})
+
+    def load_for_city(self, city: Optional[str], cities_dir: str = None) -> List[BaseMenuRule]:
+        """Load the ruleset for *city* from ``CITY_RULES_DIR`` (``<city>.json``),
+        resolving ``extends``. Falls back to ``DEFAULT_CITY`` when the city is
+        unknown/blank or has no file of its own."""
+        base = Path(cities_dir or CITY_RULES_DIR)
+        norm = (city or '').strip().lower()
+        path = base / f"{norm}.json"
+        if not norm or not path.exists():
+            path = base / f"{DEFAULT_CITY}.json"
+        return self.load_from_file(str(path))
+
+    def _resolve_rule_dicts(self, path: Path, seen: set) -> List[Dict[str, Any]]:
+        """Return the merged list of rule *dicts* for a city file, applying its
+        ``extends`` parent first, then this file's overrides/additions."""
+        path = Path(path)
+        key = str(path.resolve())
+        if key in seen:
+            raise ValueError(f"circular 'extends' involving {path.name}")
+        seen.add(key)
+        with open(path, 'r') as f:
+            blob = json.load(f)
+        parent: List[Dict[str, Any]] = []
+        ext = blob.get('extends')
+        if ext:
+            parent = self._resolve_rule_dicts(path.parent / f"{ext}.json", seen)
+        child = list(blob.get('rules', blob.get('constraints', [])))
+        return self._merge_rule_dicts(parent, child, blob.get('disable', []))
+
+    @staticmethod
+    def _merge_rule_dicts(parent, child, disable) -> List[Dict[str, Any]]:
+        """Merge *child* rule dicts over *parent*: same ``name`` overrides,
+        new names append (parent order preserved), names in *disable* drop.
+        Nameless rules are always appended (never override).
+
+        An override is a **per-key** merge, not a whole-dict replacement: keys
+        the child omits are inherited from the parent rule of the same name.
+        Whole-dict replacement silently dropped sibling keys — F5 and Cigna
+        override ``nonveg_main_daily_pair`` with just ``components``, which
+        deleted the city rule's ``components_by_theme`` and left their Chinese
+        day with no Chinese requirement and their biryani day with no biryani.
+        Inheriting the omitted keys keeps a partial override meaning "change
+        this field", which is what every author of these files expects.
+
+        To *remove* an inherited key, set it to ``null`` in the child (dropped
+        below), or drop the whole rule via ``disable``.
+        """
+        disable = set(disable or [])
+        by_name: Dict[str, Any] = {}
+        order: List[str] = []
+        anon: List[Dict[str, Any]] = []
+        for r in list(parent) + list(child):
+            n = r.get('name')
+            if not n:
+                anon.append(r)
+                continue
+            if n not in by_name:
+                order.append(n)
+                by_name[n] = dict(r)
+                continue
+            merged = {**by_name[n], **r}
+            inherited = sorted(set(by_name[n]) - set(r))
+            if inherited:
+                logger.info(
+                    "Rule %r overridden; inheriting unspecified key(s) from the "
+                    "base rule: %s", n, ", ".join(inherited),
+                )
+            by_name[n] = {k: v for k, v in merged.items() if v is not None}
+        return [by_name[n] for n in order if n not in disable] + anon
+
+    def load_from_dict(self, config_data: Dict[str, Any]) -> List[BaseMenuRule]:
+        self.rules = []
+        rules_list = config_data.get('rules', config_data.get('constraints', []))
+        for rule_config in rules_list:
+            try:
+                rule = self._create_rule(rule_config)
+                if rule and rule.validate_config():
+                    self.rules.append(rule)
+                else:
+                    _log_invalid_rule(rule, rule_config, scope="rule")
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("Error creating rule: %s", e)
+        logger.info("Loaded %d menu rule(s)", len(self.rules))
+        return self.rules
+
+    def _create_rule(self, rule_config: Dict[str, Any]) -> Optional[BaseMenuRule]:
+        rule_type = rule_config.get('type', '').lower()
+        if rule_type not in self.RULE_CLASSES:
+            raise ValueError(f"Unknown rule type: {rule_type}")
+        return self.RULE_CLASSES[rule_type](rule_config)
+
+    @classmethod
+    def _read_rule_library(cls) -> Dict[str, Any]:
+        """Named reusable rule bodies, keyed by component name."""
+        path = Path(RULE_LIBRARY_PATH)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, 'r') as f:
+                blob = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to read rule_library.json: %s", exc)
+            return {}
+        if not isinstance(blob, dict):
+            return {}
+        return {k: v for k, v in blob.items()
+                if not k.startswith('_') and isinstance(v, dict)}
+
+    @classmethod
+    def _expand_uses(cls, uses: Any) -> List[Dict[str, Any]]:
+        """Turn a client's ``use`` list into concrete rule dicts.
+
+        Each entry is either the component's name, or
+        ``{"ref": name, "as": rule_name, "with": {overrides}}``. Overrides are a
+        per-key merge over the component — the same semantics a client rule
+        already uses to override a city rule — so one component covers a family
+        of requirements without a templating language.
+
+        An unknown ``ref`` is a hard error rather than a silent skip: a typo
+        would otherwise mean the client quietly loses a rule, which is the same
+        failure mode as the byte-for-byte client-name lookup.
+        """
+        if not uses:
+            return []
+        library = cls._read_rule_library()
+        out: List[Dict[str, Any]] = []
+        for entry in uses:
+            if isinstance(entry, str):
+                ref, alias, overrides = entry, None, {}
+            elif isinstance(entry, dict):
+                ref = entry.get('ref')
+                alias = entry.get('as')
+                overrides = entry.get('with') or {}
+            else:
+                logger.warning("Ignoring malformed `use` entry: %r", entry)
+                continue
+            component = library.get(ref)
+            if component is None:
+                raise ValueError(
+                    f"`use` references unknown rule component {ref!r}; "
+                    f"available: {sorted(library)}")
+            rule = {k: v for k, v in component.items() if k != '_doc'}
+            rule.update(overrides)
+            rule.setdefault('name', ref)
+            if alias:
+                rule['name'] = alias
+            out.append(rule)
+        return out
+
+    @staticmethod
+    def _parse_client_block(
+        client_block: Any, counter_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Normalise a per-client ``client_rules.json`` value.
+
+        Accepts the legacy list form ``[rule, …]`` or the object form::
+
+            {"disable": [...], "rules": [...], "constant_items": {...},
+             "counters": {"<counter name>": {"disable": [...], "rules": [...],
+                                             "constant_items": {...}}}}
+
+        ``counters`` scopes an override to one counter of a multi-counter client.
+        A client-level entry applies to every counter, which is wrong for rules
+        that only make sense for one station: L&T's "Non Veg Lunch" counter is
+        themed biryani every day, so the weekly nonveg-biryani cap has to come
+        off *there* — but leaving it off client-wide would silently disable it if
+        another L&T counter ever gains a nonveg_main slot.
+
+        Counter entries are layered over the client-level ones, so shared
+        overrides stay declared once.
+        """
+        empty = {'disable': [], 'rules': [], 'constant_items': {},
+                 'combo_majority': {}}
+        if isinstance(client_block, list):
+            return {**empty, 'rules': list(client_block)}
+        if not isinstance(client_block, dict):
+            return dict(empty)
+
+        def _layer(block: Dict[str, Any]) -> Dict[str, Any]:
+            rules = block.get('rules', block.get('constraints', []))
+            # Library components come FIRST so a rule the client spells out by
+            # the same name overrides the shelf version rather than duplicating
+            # it.
+            shelf = MenuRuleLoader._expand_uses(block.get('use'))
+            return {
+                'disable': list(block.get('disable') or []),
+                'rules': shelf + list(rules or []),
+                'constant_items': dict(block.get('constant_items') or {}),
+                'combo_majority': dict(block.get('combo_majority') or {}),
+            }
+
+        merged = _layer(client_block)
+        counters = client_block.get('counters')
+        if counter_name and isinstance(counters, dict):
+            scoped = counters.get(counter_name)
+            if isinstance(scoped, dict):
+                layer = _layer(scoped)
+                merged['disable'] = merged['disable'] + layer['disable']
+                merged['rules'] = merged['rules'] + layer['rules']
+                merged['constant_items'] = {
+                    **merged['constant_items'], **layer['constant_items'],
+                }
+                merged['combo_majority'] = {
+                    **merged['combo_majority'], **layer['combo_majority'],
+                }
+        return merged
+
+    @classmethod
+    def _read_client_blob(cls) -> Dict[str, Any]:
+        """Every client's override block, keyed by ``clients.name``.
+
+        Reads ``CLIENT_RULES_DIR`` — one file per client, each holding a single
+        top-level ``{"<client name>": {...}}`` — and falls back to the legacy
+        single ``client_rules.json`` when the directory is absent or empty, so a
+        deployment that has not taken the split still works.
+
+        **The client name lives inside the file, not in the filename.** The
+        lookup is an exact byte-for-byte match against ``clients.name`` and a
+        mismatch is silent: every rule for that client loads as zero, /diagnose
+        still reports clean, and a plausible plan comes back having ignored all
+        of them. Names like ``Booking.com``, ``L&T`` and ``ToastTab CHN`` cannot
+        survive a round trip through a filesystem-safe slug, so the filename is
+        cosmetic and the key is authoritative.
+
+        A client defined in two files is a hard error rather than a silent
+        last-one-wins: that is the same class of bug as the name mismatch above,
+        and it would be invisible in a diff of either file.
+        """
+        merged: Dict[str, Any] = {}
+        directory = Path(CLIENT_RULES_DIR)
+        if directory.is_dir():
+            for path in sorted(directory.glob('*.json')):
+                try:
+                    with open(path, 'r') as f:
+                        blob = json.load(f)
+                except (json.JSONDecodeError, OSError) as exc:
+                    logger.warning("Failed to read %s: %s", path.name, exc)
+                    continue
+                if not isinstance(blob, dict):
+                    logger.warning("%s: expected an object at the top level, "
+                                   "got %s — skipped", path.name,
+                                   type(blob).__name__)
+                    continue
+                for name, block in blob.items():
+                    if name in merged:
+                        raise ValueError(
+                            f"client {name!r} is defined in more than one file "
+                            f"under {directory} (latest: {path.name}); the "
+                            f"loader cannot know which one you meant")
+                    merged[name] = block
+        if merged:
+            return merged
+
+        path = Path(CLIENT_RULES_CONFIG_PATH)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, 'r') as f:
+                blob = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to read client_rules.json: %s", exc)
+            return {}
+        return blob if isinstance(blob, dict) else {}
+
+    def get_shared_categories(self, client_name: str) -> List[str]:
+        """Base slots this client serves identically across all its counters.
+
+        Read from the client's top-level ``shared_categories`` list in
+        ``client_rules.json`` (empty when unset or the entry is the legacy bare
+        rule list). The planner uses it to pin the primary counter's choice for
+        each of these slots into the other counters on the matching day — the
+        "common categories are the same across counters" requirement. Cross-
+        counter coordination is client-orchestrated, so this is a hint the
+        planner reads, not a solver rule.
+        """
+        return self._client_string_list(client_name, 'shared_categories')
+
+    def get_meal_shared_categories(self, client_name: str) -> List[str]:
+        """Base slots a LATER service copies from the first one, same day.
+
+        The twin of ``shared_categories``, one axis over: that one syncs a
+        slot across COUNTERS within a service, this one syncs it across
+        SERVICES within a counter. Corning Chakan states it plainly — "dessert,
+        soup and indian bread shall be the same as lunch" — and nothing else
+        could express it, because the two services are separate solves and the
+        planner's default is the opposite: every lunch dish is BANNED at dinner
+        (note 39).
+
+        Lives in the client rules file rather than a `clients` column because
+        it needs no editor control and no migration; the client-config endpoint
+        serves it beside `shared_categories` so the planner reads both the same
+        way.
+        """
+        return self._client_string_list(client_name, 'meal_shared_categories')
+
+    def get_shared_category_exclusions(self, client_name: str) -> List[str]:
+        """Counters that must NOT receive the shared-category pins.
+
+        ``clients.shared_categories`` is client-wide: every counter after the
+        primary gets the primary's dish for each shared slot. ICON Chn needs one
+        counter left out of that — "rice combo counter is not linked to the
+        shared items list it has seprate menu" — and without an exclusion the
+        primary's veg dry, veg gravy and dessert would be pinned into the one
+        counter the client says is independent.
+
+        Declared in the client's rules file rather than in the DB because it is a
+        statement about the menu's structure, like the rules beside it, and the
+        editor has no control for it. The planner reads it through
+        ``GET /client-config``; a counter named here is simply not sent
+        ``shared_items``, so it solves exactly as a single-counter client would.
+        """
+        return self._client_string_list(
+            client_name, 'shared_categories_excluded_counters')
+
+    def _client_string_list(self, client_name: str, key: str) -> List[str]:
+        block = self._read_client_blob().get(client_name)
+        if not isinstance(block, dict):
+            return []
+        raw = block.get(key) or []
+        if not isinstance(raw, list):
+            return []
+        # De-dupe, drop blanks, preserve order.
+        seen: set = set()
+        out: List[str] = []
+        for c in raw:
+            s = str(c).strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def get_client_constant_items(
+        self, client_name: str, counter_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return ``constant_items`` for *client_name* (empty dict if unset).
+
+        *counter_name* layers that counter's ``counters`` entry over the
+        client-level one.
+        """
+        block = self._read_client_blob().get(client_name)
+        if not block:
+            return {}
+        return self._parse_client_block(block, counter_name)['constant_items']
+
+    def get_client_combo_majority(
+        self, client_name: str, counter_name: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """``{combo slot: component}`` for *client_name* (empty dict if unset).
+
+        Which half of a combination category gets the majority of the days on
+        this counter. `COMBO_CATEGORIES` picks one globally — dal leads
+        `dal_sambar`, rasam leads `sambar_rasam` — and a site wanting the other
+        half on three days had no way to say so.
+
+        Returned as written and validated where it is used, not here: a bad key
+        must not stop a client loading, and `_combo_day_variant` falls back to
+        the global order for anything that is not one of the slot's own two
+        components. `tests/clients/test_client_combo_majority.py` is what makes
+        a typo visible instead of silent.
+        """
+        block = self._read_client_blob().get(client_name)
+        if not block:
+            return {}
+        return self._parse_client_block(block, counter_name)['combo_majority']
+
+    def get_counter_scoped_constant_keys(
+        self, client_name: str, counter_name: Optional[str] = None,
+    ) -> set:
+        """Slots pinned inside *counter_name*'s OWN block, not client-wide.
+
+        `constant_items` is normally client-scoped, so a pin for a slot the
+        counter does not serve has to be dropped — it probably belongs to a
+        sibling station. A pin written inside one counter's block carries no such
+        ambiguity: the config already said which station it is for. That makes it
+        a FIXED ITEM for that counter, printable without the slot being
+        configured as a rotating category, exactly as a single-counter client's
+        pin is.
+
+        Returns bare slot ids; the caller compares them against the pins it
+        resolved.
+        """
+        if not counter_name:
+            return set()
+        block = self._read_client_blob().get(client_name)
+        if not isinstance(block, dict):
+            return set()
+        counters = block.get('counters')
+        if not isinstance(counters, dict):
+            return set()
+        own = counters.get(counter_name)
+        if not isinstance(own, dict):
+            return set()
+        pins = own.get('constant_items')
+        if not isinstance(pins, dict):
+            return set()
+        return {k for k in pins if not str(k).startswith('_')}
+
+    def _rebuild(self, rules: List[BaseMenuRule],
+                 client_name: str) -> List[BaseMenuRule]:
+        """Fresh instances of *rules*, reconstructed from their configs.
+
+        A rule that cannot be rebuilt is passed through rather than dropped: a
+        shared instance is a concurrency hazard, but losing a constraint
+        silently is worse than the hazard. Stubs with no ``config`` (tests pass
+        them) have nothing to rebuild from and are passed through too.
+        """
+        out: List[BaseMenuRule] = []
+        for rule in rules:
+            cfg = getattr(rule, 'config', None)
+            if not cfg:
+                out.append(rule)
+                continue
+            try:
+                fresh = self._create_rule(dict(cfg))
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning("Could not rebuild rule %s for %s: %s",
+                               getattr(rule, 'name', '?'), client_name, exc)
+                fresh = None
+            out.append(fresh if fresh is not None else rule)
+        return out
+
+    def load_for_client(
+        self, client_name: str, generic_rules: List[BaseMenuRule],
+        counter_name: Optional[str] = None,
+    ) -> List[BaseMenuRule]:
+        """Merge city/generic rules with per-client overrides for *client_name*.
+
+        Reads ``CLIENT_RULES_CONFIG_PATH`` fresh every call. Client entries may
+        be a legacy rule list or ``{disable, rules, constant_items}``. Merge
+        semantics match city ``extends``: same ``name`` overrides, ``disable``
+        drops by name. Missing file / unknown client → *generic_rules* unchanged.
+
+        *counter_name* additionally applies that counter's ``counters`` entry, so
+        an override can be scoped to one station of a multi-counter client.
+
+        **The returned rules are always fresh instances**, including when the
+        client has no overrides at all. `generic_rules` is the process-wide
+        ruleset `OntologyRepository.rules_for_city` caches per city, and rules
+        are not stateless: `UniqueItemsMenuRule.apply()` stores the model's
+        repeat-penalty VARIABLES on `self` for `get_objective_terms()` to read
+        back. Handing the same instance to two concurrent solves — which the
+        `@solver_gate` allows by design, and which any two clients of one city
+        hit — lets the second `apply()` clobber the first's list, so the first
+        solve's objective references variables belonging to the other model and
+        CP-SAT rejects it as MODEL_INVALID. Rebuilding costs one `_create_rule`
+        per rule against a CP-SAT solve, and the override path below always did
+        it anyway; the early return was the only sharing route.
+        """
+        client_block = self._read_client_blob().get(client_name)
+        if not client_block:
+            return self._rebuild(generic_rules, client_name)
+
+        parsed = self._parse_client_block(client_block, counter_name)
+        parent_dicts = [
+            dict(getattr(r, 'config', {}) or {})
+            for r in generic_rules
+            if getattr(r, 'config', None) is not None
+        ]
+        # Preserve rules that somehow lack a config dict (tests may pass stubs).
+        stubs = [r for r in generic_rules if getattr(r, 'config', None) is None]
+        merged_dicts = self._merge_rule_dicts(
+            parent_dicts, parsed['rules'], parsed['disable'],
+        )
+        merged: List[BaseMenuRule] = list(stubs)
+        for rule_cfg in merged_dicts:
+            try:
+                rule = self._create_rule(rule_cfg)
+                if rule and rule.validate_config():
+                    merged.append(rule)
+                else:
+                    _log_invalid_rule(
+                        rule, rule_cfg,
+                        scope=f"per-client rule for {client_name}",
+                    )
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "Error creating per-client rule for %s: %s",
+                    client_name, exc)
+        n_extra = len(parsed['rules'])
+        n_disabled = len(parsed['disable'])
+        logger.info(
+            "Merged client '%s'%s: %d override/add rule(s), %d disabled → %d total",
+            client_name, f" counter '{counter_name}'" if counter_name else "",
+            n_extra, n_disabled, len(merged),
+        )
+        return merged
+
+    def get_rules_by_type(self, rule_type: str) -> List[BaseMenuRule]:
+        return [r for r in self.rules if r.rule_type.value == rule_type]
+
+    def get_enabled_rules(self) -> List[BaseMenuRule]:
+        return list(self.rules)

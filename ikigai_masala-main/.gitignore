@@ -1,0 +1,8 @@
+# The README tells you to write a Supabase service_role key into this file,
+# and `.streamlit/config.toml` claims it is ignored. It was not — nothing in
+# this file matched it, so the one file in the repo that is SUPPOSED to hold a
+# secret was the one file tracked by default.
+.streamlit/secrets.toml
+
+# atomic-write temp files
+*.xlsx.tmp

@@ -1,0 +1,77 @@
+{
+  "Moengage": {
+    "_comment": "Bangalore site (its clients.city is NULL — see scripts/backfill_client_city.sql). Mutton once a month is wired as a CAP now that a client menu import brought `dhaba_style_mutton_curry` into Bangalore; it was inert while the city carried no mutton at all. Cap rather than target for the same reason as Stripe's: with one eligible dish, a positive cadence would force that dish monthly regardless of the rest of the plate.",
+    "disable": [],
+    "use": [
+      {
+        "ref": "selector_weekly_max",
+        "as": "moengage_aloo_once_a_week",
+        "with": {
+          "selector": {
+            "key_ingredient": "potato"
+          },
+          "max": 1
+        }
+      }
+    ],
+    "rules": [
+      {
+        "_comment": "Banned in the main course: pumpkin, brinjal, yam and bisi bele bath. ingredient_ban matches key_ingredient AND primary_protein; the bath is a named dish, so it is banned by name in the rice slot.",
+        "name": "moengage_banned_ingredients",
+        "type": "ingredient_ban",
+        "ingredients": [
+          "pumpkin",
+          "brinjal",
+          "eggplant",
+          "yam",
+          "elephant_yam"
+        ]
+      },
+      {
+        "_comment": "Mutton at most once a MONTH, enforced across plans from saved history (30-day window, the same shape as Pune's monthly oil-based bread). Selects on primary_protein — there is no is_mutton flag, and `dhaba_style_mutton_curry` is the Bangalore list's only mutton dish. Pairs with moengage_mutton_max_1 for the within-plan half.",
+        "name": "moengage_mutton_30d_window",
+        "type": "selector_history_window",
+        "base_slot": "nonveg_main",
+        "selector": {
+          "primary_protein": "mutton"
+        },
+        "window_days": 30
+      },
+      {
+        "_comment": "The within-plan half: the history window only reads saved plans, so a single long horizon could otherwise place mutton on two of its own days.",
+        "name": "moengage_mutton_max_1",
+        "type": "selector_frequency",
+        "base_slot": "nonveg_main",
+        "selector": {
+          "primary_protein": "mutton"
+        },
+        "max": 1
+      },
+      {
+        "_comment": "Bisi bele bath by name — it is a dish, not an ingredient.",
+        "name": "moengage_no_bisibele_bath",
+        "type": "selector_frequency",
+        "selector": {
+          "name_contains": [
+            "bisibele",
+            "bisi_bele",
+            "bise_bele"
+          ]
+        },
+        "max": 0
+      },
+      {
+        "_comment": "'Week 1-2 egg non veg main is compulsory' — an egg dish in the non-veg slot on one or two days of the week, and compulsory, so it is a floor as well as a cap. `min: 1` is what makes it compulsory; `max: 2` is the upper end of the client's range. Bangalore carries 121 egg dishes in `nonveg_main`, so neither bound is at risk of relaxing. Counted in DAYS: this counter serves two non-veg dishes, so the one or two days it lands on may each carry an egg dish beside a chicken one — which is what a non-veg station does, and what `daily_max` would have to be added to prevent.",
+        "name": "moengage_egg_1_or_2_days",
+        "type": "selector_frequency",
+        "base_slot": "nonveg_main",
+        "selector": {
+          "flag": "is_egg_dish"
+        },
+        "min": 1,
+        "max": 2
+      }
+    ],
+    "constant_items": {}
+  }
+}
