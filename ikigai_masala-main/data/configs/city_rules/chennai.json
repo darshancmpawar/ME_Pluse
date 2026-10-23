@@ -1,0 +1,536 @@
+{
+  "description": "chennai menu rules — standalone (no `extends`), because inheriting Bangalore's ruleset keyed a third of its rules on flags Chennai's list leaves at 0. Chennai has NO welcome drinks at all (no `welcome_drink` course_type, `is_welcome_drink` = 0 across 361 rows), so every drink rule Bangalore ships was silently inert here. NOTE ON SCOPE: this is the engine skeleton plus the caps that are provable from the item list — it is NOT a transcription of a Chennai rulebook, because none has been supplied. Pune's 36 rules came from `Pune_menu_rulebook_101.xlsx`; the equivalent regional rules for Chennai (which kuzhambu on which day, poriyal/kootu rotation, rasam cadence) still need that document. Everything below is either universal engine behaviour or a cap whose selector was verified to match real Chennai items — see tests/test_chennai_rules.py, which fails if any rule stops matching.",
+  "rules": [
+    {
+      "_comment": "21-day item cooldown, same window as every other city. Three weeks, and it spans SERVICES: `explode_history_rows` drops the `meal` column, so a dish served at dinner is banned from lunch for the same three weeks and the other way round.",
+      "name": "item_cooldown_21d",
+      "type": "item_cooldown",
+      "cooldown_days": 21
+    },
+    {
+      "_comment": "No dish twice inside one plan.",
+      "name": "unique_items_session",
+      "type": "unique_items",
+      "scope": "session"
+    },
+    {
+      "_comment": "Don't reissue a week's whole signature within 30 days.",
+      "name": "no_repeat_weeks",
+      "type": "week_signature_cooldown",
+      "cooldown_days": 30
+    },
+    {
+      "_comment": "Theme filter. `welcome_drink` is not in the exempt list because Chennai has no welcome drinks to exempt. `sambar`, `rasam`, `curd`, `curd_side` and `curd_rice` ARE exempt: they are the South Indian spine of every Chennai lunch and must survive a north or biryani themed day — without the exemption a north day filters the sambar pool to nothing and the slot silently drops. `dessert` is exempt for a measured reason: 26 of Chennai's 28 desserts are tagged cuisine_family=north_indian and only 2 (badusha, mysore_pak) south_indian, so a south day narrowed the dessert pool to TWO dishes and any week with 3+ south days was INFEASIBLE on uniqueness alone. The tagging is also wrong — payasam, semiya_payasam and all three kesaris are South Indian and filed north — but exempting the slot is the right fix regardless: a canteen dessert is not what makes a day South Indian, and the ruleset should not depend on 5 dishes being re-tagged to stay feasible. `bread` is exempt because the sample week contradicts theming it: Toast Tab serves CHAPPATHI / CHAPATHI / PARATHA on its South Indian days, but the filter narrows bread to the 10 south-tagged rows, which are the dosai and idly family — so a themed bread slot produced 'podi idly' as the bread row on a south day. A Chennai canteen serves chapati alongside a Tamil meal every day; bread is not what makes the day South Indian.",
+      "_comment2": "`slot_pool_by_theme` is the one place a theme overrides the exempt list above, because it is written down rather than inferred: on a Chinese day the soup, the salad and the bread are named. Chennai's list has 4 Chinese soups and 12 chapati-family breads, and ZERO Chinese salads — the salad narrowing therefore degrades here every time and stamps the relaxation, which is the honest outcome and is left in rather than deleted so the explanation names it. Exempting `bread` from the CUISINE filter and holding it to the chapati family on a Chinese day are not in conflict: the exemption exists so a south day is not forced onto podi idly, and the chapati family is exactly the bread the comment above says a Chennai canteen serves every day.",
+      "name": "theme_cuisine_filter",
+      "type": "theme_slot_filter",
+      "exempt_slots": [
+        "dal",
+        "salad",
+        "soup",
+        "healthy_rice",
+        "rice",
+        "sambar",
+        "rasam",
+        "curd",
+        "curd_side",
+        "curd_rice",
+        "dessert",
+        "bread",
+        "veg_dry"
+      ],
+      "slot_pool_by_theme": {
+        "chinese": {
+          "soup": {
+            "cuisine_family": "chinese"
+          },
+          "salad": {
+            "cuisine_family": "chinese"
+          },
+          "bread": {
+            "flag": "is_plain_phulka_chapathi"
+          }
+        }
+      }
+    },
+    {
+      "_comment": "Colour variety. Chennai's list is brown-heavy — 194 of 361 rows (54%) are brown, against 67 red and 34 yellow — so Pune's flat cap of 2 per colour is too tight here: a day drawing 6 colour slots from a 54%-brown pool needs somewhere to put the third brown dish. This uses Bangalore's asymmetric shape instead: every colour capped at 2, with ONE colour allowed to reach 3.",
+      "name": "colour_three_distinct_one_colour_may_reach_three",
+      "type": "color_variety",
+      "min_distinct_per_day": 3,
+      "min_distinct_per_day_chinese": 3,
+      "min_distinct_per_day_biryani": 3,
+      "max_same_color_per_day": 2,
+      "max_same_color_reach": 3,
+      "max_colors_at_reach": 1
+    },
+    {
+      "_comment": "Plain chapati/phulka may run on consecutive days — the same reasoning as Pune's R36, selected by NAME for the same reason: the `is_plain_phulka_chapathi` flag covers the flavoured chapatis too (12 Chennai rows) and `sub_category: plain_chapatti/phulka` wrongly includes `garlic_chapati`, while permission to repeat every day belongs to the plain bread alone. Two dishes against a 107-dish bread pool, so this is far less load-bearing here than in Pune — but a counter serving chapati daily still needs the exemption or week 2 has no chapati.",
+      "name": "plain_chapati_may_repeat",
+      "type": "repeatable_items",
+      "base_slot": "bread",
+      "selector": {
+        "any_of": [
+          {
+            "item": "chapati"
+          },
+          {
+            "item": "phulka"
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Rasam is a staple, and this one is load-bearing: the list holds exactly TWO rasam dishes (rasam, jeera_rasam) and a Chennai counter serves rasam most days. Under unique_items + the 21-day cooldown the slot is empty by day 3 of the first plan, never mind week 2. Rasam is the daily tamarind broth, not a variety slot — the same call as steamed rice.",
+      "name": "rasam_is_a_staple",
+      "type": "repeatable_items",
+      "base_slot": "rasam",
+      "selector": {
+        "course_type": "rasam"
+      }
+    },
+    {
+      "_comment": "Curd and raita are staples, for the reason Pune's raita_is_a_staple documents: 4 curd_side rows (plus 1 plain curd) against a slot served daily. A yogurt side is an accompaniment, not variety.",
+      "name": "curd_and_raita_are_staples",
+      "type": "repeatable_items",
+      "base_slot": "curd_side",
+      "selector": {
+        "course_type": "curd_side"
+      }
+    },
+    {
+      "_comment": "Curd rice likewise — the list holds 2 (curd_rice, dry_fruits_curd_rice) and Toast Tab serves it on every flavoured-rice day.",
+      "name": "curd_rice_is_a_staple",
+      "type": "repeatable_items",
+      "base_slot": "curd_rice",
+      "selector": {
+        "flag": "is_curd_rice"
+      }
+    },
+    {
+      "_comment": "One premium veg gravy a week (25 eligible rows). Cost rule, same as Pune's.",
+      "name": "premium_gravy_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_premium_gravy"
+      },
+      "base_slot": "veg_gravy",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "One premium veg dry a week (7 eligible rows).",
+      "name": "premium_veg_dry_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_premium_veg_dry"
+      },
+      "base_slot": "veg_dry",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "At most one premium veg dish on any single day, so the two weekly premiums cannot stack onto one plate.",
+      "name": "premium_veg_daily_max_1",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_premium_veg"
+      },
+      "daily_max": 1
+    },
+    {
+      "_comment": "One mixed-veg pulao or veg biryani a week in the rice slot (8 + 4 rows).",
+      "name": "mixedveg_pulao_biryani_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "any_flag": [
+          "is_mixedveg_pulao",
+          "is_mixedveg_biryani"
+        ]
+      },
+      "base_slot": "rice",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "One non-veg biryani a week (5 rows). Chennai's non-veg pool is 63 dishes, so this leaves plenty for the other days.",
+      "name": "nonveg_biryani_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_nonveg_biryani"
+      },
+      "base_slot": "nonveg_main",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "At most one non-veg biryani on a day, so a multi-slot non-veg counter cannot satisfy the weekly cap by stacking two onto one day (the trap note 9e documents).",
+      "name": "nonveg_biryani_daily_max_1",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_nonveg_biryani"
+      },
+      "daily_max": 1
+    },
+    {
+      "_comment": "One maida (refined-flour) bread a week — 15 rows, so this is a real constraint on a 29-dish bread pool.",
+      "name": "maida_bread_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_maida_bread"
+      },
+      "base_slot": "bread",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "Dosa, idly, uthappam and adai/pesarattu belong to a South Indian day and nowhere else. Led by SUB_CATEGORY because Chennai is where the flags leak worst: `is_dosa_family` and `is_rice_bread` catch 42 of the 100 breads and the sub_categories catch 61, and the 20 the flags miss include `idli` itself, `masala_idli`, `podi_idli`, `onion_uthappam` and `pesarattu`. A generated week proved it — with the flags alone the rule moved the dosas off a biryani Monday and a mix Wednesday and left `masala_idli` and `tri_color_idli` standing in their place. `idli_/_steamed` also holds the poha, upma, sevai and idiyappam rows, which belong to the same tiffin family and are wanted here. `rotis` and `wheat-based_dosa` are omitted: Chennai's list has neither sub_category, and a branch that matches nothing is the cheap half of note 9's failure. 62 of 100 held back is the heaviest share of the five lists, a deliberate consequence of the owner's instruction and the one city where it bites, because a Chennai canteen does serve dosa on an ordinary day. Chapati is a declared staple here (`plain_chapati_may_repeat`), so a day this narrows always has a bread to fall back on; the ban degrades anyway on a day whose pool is nothing else, and says so.",
+      "name": "south_bread_south_day_only",
+      "type": "selector_frequency",
+      "selector": {
+        "any_of": [
+          {
+            "sub_category": "classic_dosa"
+          },
+          {
+            "sub_category": "masala_/_flavoured_dosa"
+          },
+          {
+            "sub_category": "millet-based_dosa"
+          },
+          {
+            "sub_category": "lentil-based_dosa_(adai/pesarattu)"
+          },
+          {
+            "sub_category": "uthappam"
+          },
+          {
+            "sub_category": "idli_/_steamed"
+          },
+          {
+            "flag": "is_dosa_family"
+          },
+          {
+            "flag": "is_rice_bread"
+          }
+        ]
+      },
+      "base_slot": "bread",
+      "allowed_day_types": [
+        "south"
+      ]
+    },
+    {
+      "_comment": "Baby corn once a week. Matched on the dish NAME, not `key_ingredient` — in Chennai all 4 baby-corn rows agree on both, but Bangalore's list showed key_ingredient='baby_corn' is the de-facto default for a mixed salad (67 rows, 3 of them actually baby corn), so the name is the trustworthy column across cities.",
+      "name": "baby_corn_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "name_contains": [
+          "baby_corn",
+          "babycorn"
+        ]
+      },
+      "max_per_week": 1
+    },
+    {
+      "_comment": "One leafy veg dry a week (4 rows: keerai and mint dishes).",
+      "name": "leafy_veg_dry_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_leafy_based_dish"
+      },
+      "base_slot": "veg_dry",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "Kootu at most twice a week. Chennai-specific and only expressible because `kootu` is its own sub_category (7 rows) — `course_type` files kootu under veg_gravy alongside the kurmas, so a course_type selector could not separate them. Two rather than one because kootu is an everyday Tamil dish, not a treat.",
+      "name": "kootu_twice_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "sub_category": "kootu"
+      },
+      "max_per_week": 2
+    },
+    {
+      "_comment": "One chana gravy a week (4 rows).",
+      "name": "chana_gravy_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_chana_gravy"
+      },
+      "max_per_week": 1
+    },
+    {
+      "_comment": "Dal colour must not repeat on adjacent days.",
+      "name": "dal_colour_non_consecutive",
+      "type": "attribute_grouping",
+      "base_slot": "dal",
+      "group_by": "item_color",
+      "non_consecutive": true
+    },
+    {
+      "_comment": "Each sambar key ingredient at most twice per horizon — the 7-dish sambar pool would otherwise rotate two vegetables all week.",
+      "name": "sambar_key_ingredient_max_two",
+      "type": "attribute_grouping",
+      "base_slot": "sambar",
+      "group_by": "key_ingredient",
+      "max_per_group": 2
+    },
+    {
+      "_comment": "Vary the dessert form across adjacent days (halwa / payasam / kheer / laddu).",
+      "name": "dessert_form_non_consecutive",
+      "type": "attribute_grouping",
+      "base_slot": "dessert",
+      "group_by": "dessert_form",
+      "non_consecutive": true
+    },
+    {
+      "_comment": "Vary the veg gravy's key ingredient across the week.",
+      "name": "veg_gravy_key_ingredient_variety",
+      "type": "soft_preference",
+      "mode": "avoid_attribute_repeat",
+      "priority": "high",
+      "base_slot": "veg_gravy",
+      "group_by": "key_ingredient",
+      "scope": "week"
+    },
+    {
+      "_comment": "Same for the veg dry.",
+      "name": "veg_dry_key_ingredient_variety",
+      "type": "soft_preference",
+      "mode": "avoid_attribute_repeat",
+      "priority": "high",
+      "base_slot": "veg_dry",
+      "group_by": "key_ingredient",
+      "scope": "week"
+    },
+    {
+      "_comment": "The veg plate must not echo itself. veg_gravy and veg_dry together may not serve the same key ingredient on one day — a paneer gravy beside a paneer dry is legal under every other rule (different course_type, different colour, different texture) and reads as one dish served twice. HARD, and measured as feasible on all 78 counters that run either slot before it was written: every one can give each veg cell a distinct named key ingredient. Scoped to these two slots on purpose. Plate-wide is the reading that sounds right and cannot be built — `nonveg_main` carries six distinct key ingredients in the whole ontology against a mandated daily chicken gravy, `dal`'s value is literally `dal` on all 59 counters, `bread`'s is `wheat` on 64 and `rice`'s is `mixed_vegetables` on 61. In those slots the key ingredient is the slot's identity, not a variety dimension. `require_value` keeps blank-key_ingredient dishes out of these two pools, without which the rule is worse than nothing: a blank is unconstrained, so the solver would escape it by serving exactly the dishes nobody has classified.",
+      "name": "veg_plate_distinct_key_ingredient",
+      "type": "attribute_grouping",
+      "base_slot": [
+        "veg_gravy",
+        "veg_dry"
+      ],
+      "group_by": "key_ingredient",
+      "max_cells_per_day": 1,
+      "require_value": true
+    },
+    {
+      "_comment": "And it must not come straight back: three CLEAR days before a key ingredient returns to the same slot, so a carrot gravy on Monday means no carrot gravy until Friday. `per_base_slot` keeps the gravy answering to other gravies and the dry to other dries — pooling them would be the plate-wide ban above, which cannot be built. Auto-relaxes per slot when the pool cannot supply a distinct value for every cell in the window, so a thin slot degrades and reports instead of taking the plan down.",
+      "name": "veg_key_ingredient_three_day_gap",
+      "type": "attribute_grouping",
+      "base_slot": [
+        "veg_gravy",
+        "veg_dry"
+      ],
+      "group_by": "key_ingredient",
+      "per_base_slot": true,
+      "min_days_between": 3,
+      "require_value": true
+    },
+    {
+      "_comment": "The rest of the plate, softly. Any key ingredient appearing on two cells of ONE day is penalised across every slot — a paneer gravy beside a paneer starter, or carrot in the gravy and the salad. SOFT rather than hard because the slots this reaches include the ones whose ingredient IS their identity: chicken must be able to outbid it on a non-veg counter, and wheat on a bread slot. `scope: day` is what makes it see a plate at all; the default horizon scope collapses a value to one bool per day and structurally cannot.",
+      "name": "plate_key_ingredient_echo",
+      "type": "soft_preference",
+      "mode": "avoid_attribute_repeat",
+      "scope": "day",
+      "priority": "medium",
+      "group_by": "key_ingredient"
+    },
+    {
+      "_comment": "The veg plate must not echo its PROTEIN either. veg_gravy and veg_dry may not serve the same primary_protein on one day: a soya chaap gravy beside a soya keema dry is one idea served twice, and the client named exactly that case. This is the second half of a pair with veg_plate_distinct_key_ingredient -- the two columns disagree often enough to need both, e.g. 121 Bangalore rows carry primary_protein soy against 98 carrying key_ingredient soy, so 23 soya dishes are invisible to the key_ingredient rule. Measured feasible on all 70 counters running 2+ veg cells before it was written. Deliberately NO require_value, which is the opposite call from the key_ingredient rule and for a real reason: a blank key_ingredient is an UNCLASSIFIED dish (a gap in the data the solver would escape into), while a blank primary_protein means NO PROTEIN FOCUS -- it is the value the enriched workbooks wrote as literal 'none' and merge_enriched_ontology folds to blank. Two plain vegetable dishes are not a repeat, so blanks are unconstrained here by design, and dropping them would delete 56% of veg_gravy and 74% of veg_dry.",
+      "name": "veg_plate_distinct_protein",
+      "type": "attribute_grouping",
+      "base_slot": [
+        "veg_gravy",
+        "veg_dry"
+      ],
+      "group_by": "primary_protein",
+      "max_cells_per_day": 1
+    },
+    {
+      "_comment": "And softly across the whole plate: any protein on two cells of ONE day is penalised -- a paneer gravy beside a paneer starter, soya in the rice and again in the veg dry. SOFT, not hard, because this reaches nonveg_main, whose protein is 0% blank and where nonveg_main_daily_pair mandates a chicken gravy every day: on a 2-cell non-veg station a second chicken dish is often forced, and chicken has to be able to outbid this. scope:day is what makes it see a plate at all -- the default horizon scope collapses a value to one bool per day and structurally cannot. PRIORITY is medium, not high, and the reason is note 32 rather than the client's emphasis: the theme tier is already measurably inverted at MAX_NUM_DAYS, a fifth high-tier soft rule widens that, and the firm half of this requirement is already carried by veg_plate_distinct_protein, which is a HARD constraint and so outranks every soft tier regardless. What stays soft here is the 'and everywhere else on the plate too' part, which is exactly the thing that should yield to a real rule.",
+      "name": "plate_protein_echo",
+      "type": "soft_preference",
+      "mode": "avoid_attribute_repeat",
+      "scope": "day",
+      "priority": "medium",
+      "group_by": "primary_protein"
+    },
+    {
+      "_comment": "...and across the week, more gently. A protein appearing on two DAYS of one ISO week is penalised across the veg slots, so a soya gravy on Monday pushes the week's other soya dishes into the following week. MEDIUM, below the same-day rule above, because the client asked to 'try and avoid it' over a week where the same-day case was stated flatly. Scoped to the veg slots rather than the whole plate on purpose: nonveg_main serves chicken on nearly every day of nearly every week by mandate, so a plate-wide week rule would spend its whole budget on a repeat no counter can avoid and would stop discriminating between the ones it can. scope:week rather than horizon because the horizon count silently tightens as the plan grows -- the defect note 26 fixed for `max`.",
+      "name": "veg_week_protein_variety",
+      "type": "soft_preference",
+      "mode": "avoid_attribute_repeat",
+      "scope": "week",
+      "priority": "medium",
+      "base_slot": [
+        "veg_gravy",
+        "veg_dry",
+        "starter",
+        "salad",
+        "rice"
+      ],
+      "group_by": "primary_protein"
+    },
+    {
+      "_comment": "The plate should not be all one texture. Five saucy dishes out of six satisfies every other rule in the system and every diner notices it is mushy, and nothing in the solver looked at texture at all. Thresholds and slot set MIRROR src/explain/checks.py::check_texture_contrast (MIN_DISTINCT_TEXTURES, MAX_ONE_TEXTURE_SHARE, MAIN_COURSES) on purpose: that check is the regression test for this rule, and two copies of a threshold are two things that can disagree. Measured achievable before it was written — across all 80 counters the best reachable dominant share is a median of 20% (worst 33%) against this 60% cap, and every counter can reach three distinct textures, so the flags this answers are avoidable rather than forced (the pool-availability test of note 33, which this check had never been put through). SOFT because texture is largely a property of the SLOT, not a free choice: veg_gravy is 98% saucy, starter 89% crisp, dal 88% saucy. A counter serving gravy + dal + non-veg is structurally saucy-heavy, and a hard cap there would trade the day's gravy for a texture score.",
+      "name": "plate_texture_spread",
+      "type": "soft_preference",
+      "mode": "prefer_attribute_spread",
+      "priority": "medium",
+      "group_by": "texture",
+      "base_slot": [
+        "bread",
+        "dal",
+        "nonveg_main",
+        "rice",
+        "starter",
+        "veg_dry",
+        "veg_gravy"
+      ],
+      "min_distinct": 3,
+      "max_share": 0.6
+    },
+    {
+      "_comment": "Don't run South Indian chicken gravies on consecutive days (10 rows) — soft, so it yields when the non-veg pool for a themed day leaves nothing else. Was 11 until fish_kuzhambu stopped being flagged is_south_chicken_gravy: it is a fish, and the deleted seafood_taxonomy step cleared the chicken flags off the 8 seafood rows.",
+      "name": "avoid_consecutive_south_chicken",
+      "type": "soft_preference",
+      "mode": "avoid_consecutive",
+      "priority": "medium",
+      "base_slot": "nonveg_main",
+      "selector": {
+        "flag": "is_south_chicken_gravy"
+      }
+    },
+    {
+      "_comment": "Seafood weekly ONCE — confirmed by the client, replacing the 2 I had inferred from the sample. `max` counts DAYS, not dishes, so with one nonveg_main slot this is one fish dish a week; a counter with 2+ nonveg slots could still stack two fish onto that one day, which `daily_max` would be the fix for if it ever matters here. Exists mainly so the seafood flags are load-bearing: Chennai is the first city list with fish, and `is_seafood` is the umbrella (`is_fish_dish` is the fish-only subset, so prawn or crab in a future list is covered without touching this rule). Drop or widen this once a Chennai rulebook states the real rate.",
+      "name": "seafood_weekly",
+      "type": "selector_frequency",
+      "selector": {
+        "flag": "is_seafood"
+      },
+      "base_slot": "nonveg_main",
+      "max_per_week": 1
+    },
+    {
+      "_comment": "Same for North Indian chicken gravies (13 rows).",
+      "name": "avoid_consecutive_north_chicken",
+      "type": "soft_preference",
+      "mode": "avoid_consecutive",
+      "priority": "medium",
+      "base_slot": "nonveg_main",
+      "selector": {
+        "flag": "is_north_chicken_gravy"
+      }
+    },
+    {
+      "_comment": "Keep the week's two premiums on different days.",
+      "name": "premiums_different_days",
+      "type": "soft_preference",
+      "mode": "different_day",
+      "priority": "medium",
+      "selector_a": {
+        "flag": "is_premium_gravy"
+      },
+      "base_slot_a": "veg_gravy",
+      "selector_b": {
+        "flag": "is_premium_veg_dry"
+      },
+      "base_slot_b": "veg_dry"
+    },
+    {
+      "_comment": "Paneer belongs on a mix / south / north day; chinese and biryani days are the fallback, not the default (client rule, all cities). SOFT on purpose: the hard equivalent is selector_frequency.allowed_day_types, which forbids paneer on the other days outright — and a counter themed chinese or biryani every weekday would then never serve paneer at all.",
+      "name": "paneer_prefers_mix_south_north_days",
+      "type": "soft_preference",
+      "mode": "prefer_day_types",
+      "priority": "high",
+      "selector": {
+        "key_ingredient": "paneer"
+      },
+      "day_types": [
+        "mix",
+        "south",
+        "north"
+      ]
+    },
+    {
+      "_comment": "No soya, baby corn, chole or mushroom on a paneer day (client rule, all cities) — they read as substitutes for each other, so serving two wastes a slot. Counted across every slot because the point is the day's plate. Baby corn matches on the dish NAME for the reason baby_corn_weekly explains. A dish satisfying BOTH sides (a paneer chana gravy) counts as paneer only, otherwise `a + b <= 1` reads `1 + 1 <= 1` and the dish becomes unservable.",
+      "name": "paneer_not_with_soya_babycorn_chole_mushroom",
+      "type": "same_day_exclusion",
+      "selector": {
+        "key_ingredient": "paneer"
+      },
+      "exclude": {
+        "any_of": [
+          {
+            "key_ingredient": "soy"
+          },
+          {
+            "name_contains": [
+              "baby_corn",
+              "babycorn"
+            ]
+          },
+          {
+            "flag": "is_chana_gravy"
+          },
+          {
+            "key_ingredient": "mushroom"
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "A kuzhambu is filed `course_type = salad` in Chennai — the client's own categorisation, applied by the deleted chennai_client_pools step so TCL's stated rule ('in salad need to give only KUZHAMBU item') has a pool to draw on. But the pool is CITY-WIDE and only TCL asked for it: without this, the five other Chennai counters with a salad slot served a kuzhambu on 1-3 days of 5 apiece (Gartner, ToastTab CHN, Tekion CHN and two RNTBCI counters), turning a salad row into a sour gravy nobody requested. So the city default is 'a salad is a salad' and TCL disables this rule. Selected by NAME because `sub_category` is `mixed_veg_curry`, which also holds the kurmas. Safe as a hard `max: 0`: 35 of Chennai's 47 salads are not kuzhambus, so the ban can never empty the slot, and `_ban_leaves_every_cell_fillable` would stand it down if it could.",
+      "name": "salad_is_not_a_kuzhambu",
+      "type": "selector_frequency",
+      "base_slot": "salad",
+      "selector": {
+        "name_contains": [
+          "kuzhambu",
+          "kolumbu",
+          "kulambu",
+          "kuzhumbu",
+          "kolambu"
+        ]
+      },
+      "max": 0
+    },
+    {
+      "_comment": "Mango is a March-to-June dish. The only MONTH-scoped rule in the fleet, and a third ban axis beside `allowed_day_types` (a cuisine) and `forbidden_weekdays` (a service day): a season is a property of the DATE and neither of the others can say it. Deliberately NOT in the seasonal high-risk lists — those are generated from the owner's sheet by a script and must not be hand-edited, and this is a standing menu policy rather than a produce-safety list. LED BY `key_ingredient`, which is what makes the rule work outside Hindi: the column catches `mavinakayi_chitranna`, `mavinakayi_rasam`, `mavinakayi_saru` (Kannada), `masala_mangai_sadam` (Tamil), `aam_panna`, `aam_ras`, `aam_ki_sabzi` and `tropical_tango` — eight dishes in this list alone that no match on the word 'mango' would ever find. The name branch is kept for the rows the column misses (`mango_sheera`, `raw_mango_paneer_masala`, `drumstick_mango_pachadi`). `mangodi` IS EXCLUDED and that is the whole reason for the `none_of`: a mangodi is a dried moong-dal dumpling, not a fruit, and NCR carries five of them (`mangodi`, `mangodi_aloo`, `mangodi_gravy`, `mangodi_ki_sabzi`, `aloo_mangodi_ki_sabzi`) that a substring match would take off the menu for eight months of the year. Same family of trap as `akki` inside `sabakki`. No `base_slot`: mango turns up as a dessert, a welcome drink, a rice, a sambar, a rasam, a salad and a bread, so a slot-scoped rule would miss most of it. Out-of-season the ban degrades, and says so, on any day whose slot has nothing else to offer.",
+      "name": "mango_is_a_march_to_june_dish",
+      "type": "selector_frequency",
+      "selector": {
+        "all_of": [
+          {
+            "any_of": [
+              {
+                "key_ingredient": "mango"
+              },
+              {
+                "key_ingredient": "raw_mango"
+              },
+              {
+                "name_contains": [
+                  "mango"
+                ]
+              }
+            ]
+          },
+          {
+            "none_of": [
+              {
+                "name_contains": [
+                  "mangodi"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "allowed_months": [
+        "march",
+        "april",
+        "may",
+        "june"
+      ]
+    }
+  ]
+}

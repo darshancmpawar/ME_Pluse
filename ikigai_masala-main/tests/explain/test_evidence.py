@@ -1,0 +1,629 @@
+"""Evidence pack construction, and the validator that makes the prose safe.
+
+The validator tests are the important ones. They are the difference between an
+explanation layer and a fluent-nonsense generator pointed at a client.
+"""
+
+import json
+
+import pytest
+
+from src.explain.evidence import (
+    attach_relaxations, attrs_from_dataframe, build_dishes, build_evidence,
+    build_plan_evidence, build_provenance,
+)
+from src.explain.renderer import day_summary, render_day, render_plan
+
+ATTRS = {
+    'veg_kurma':   {'item_color': 'green', 'texture': 'saucy', 'spice_level': 2,
+                    'richness_score': 4, 'key_ingredient': 'mixed_veg',
+                    'primary_protein': 'coconut', 'cuisine_family': 'south_indian',
+                    'course_type': 'veg_gravy'},
+    'jowar_roti':  {'item_color': 'brown', 'texture': 'bready', 'spice_level': 0,
+                    'richness_score': 1, 'key_ingredient': 'jowar',
+                    'primary_protein': 'jowar', 'cuisine_family': 'south_indian',
+                    'course_type': 'bread'},
+    'curd':        {'item_color': 'white', 'texture': 'soft', 'spice_level': 0,
+                    'richness_score': 1, 'key_ingredient': 'curd',
+                    'primary_protein': 'yogurt', 'cuisine_family': 'south_indian',
+                    'course_type': 'curd_side'},
+}
+
+DAY_ITEMS = {'veg_gravy': 'veg_kurma', 'bread': 'jowar_roti', 'curd_side': 'curd'}
+
+
+class TestBuildDishes:
+    def test_accepts_bare_strings(self):
+        d = build_dishes(DAY_ITEMS, ATTRS)
+        assert d['bread']['name'] == 'jowar_roti'
+        assert d['bread']['texture'] == 'bready'
+
+    def test_accepts_the_plan_response_shape(self):
+        """`/plan` returns {'item_base': ..., 'is_nonveg': ...} per slot."""
+        shaped = {'bread': {'item_base': 'jowar_roti', 'is_nonveg': False}}
+        assert build_dishes(shaped, ATTRS)['bread']['name'] == 'jowar_roti'
+
+    def test_unknown_dish_is_kept_not_dropped(self):
+        """A dish we cannot describe is exactly the one worth showing a human.
+
+        Dropping it would make the plate look better than it is — the same
+        silent-success failure mode the ontology audits exist to catch.
+        """
+        d = build_dishes({'rice': 'chuteny'}, ATTRS)
+        assert d['rice']['name'] == 'chuteny'
+        assert d['rice']['texture'] is None
+
+    @pytest.mark.parametrize('junk', ['nan', 'NaN', '', '   ', 'None'])
+    def test_blank_markers_become_none(self, junk):
+        attrs = {'x': {'texture': junk, 'item_color': 'red'}}
+        assert build_dishes({'rice': 'x'}, attrs)['rice']['texture'] is None
+
+    def test_numpy_scalars_survive_json(self):
+        np = pytest.importorskip('numpy')
+        attrs = {'x': {'spice_level': np.int64(2), 'richness_score': np.float64(3.5)}}
+        json.dumps(build_dishes({'rice': 'x'}, attrs))
+
+
+class TestProvenance:
+    def test_pinned_beats_freshness(self):
+        """A pinned dish is on the plate because it is pinned, full stop."""
+        dishes = build_dishes(DAY_ITEMS, ATTRS)
+        p = build_provenance(dishes, recency={'curd': 99},
+                             constant_items={'curd_side': 'curd'})
+        curd = [x for x in p if x['dish'] == 'curd']
+        assert curd and curd[0]['reason'] == 'client_constant'
+
+    def test_freshness_only_past_the_threshold(self):
+        dishes = build_dishes(DAY_ITEMS, ATTRS)
+        near = build_provenance(dishes, recency={'veg_kurma': 3})
+        far = build_provenance(dishes, recency={'veg_kurma': 26})
+        assert not [x for x in near if x['reason'] == 'freshness']
+        assert '26 days' in [x for x in far if x['dish'] == 'veg_kurma'][0]['detail']
+
+    def test_rule_comment_is_used_verbatim(self):
+        """`_comment` holds the client's own sentence. Reuse it rather than
+        inventing phrasing."""
+        dishes = build_dishes(DAY_ITEMS, ATTRS)
+        note = 'client asks for a millet bread on south days'
+        p = build_provenance(dishes, rule_notes={'bread': note})
+        assert [x for x in p if x['dish'] == 'jowar_roti'][0]['detail'] == note
+
+
+class TestEvidencePack:
+    def test_shape_and_serialisability(self):
+        pack = build_evidence(date='2026-09-10', day_items=DAY_ITEMS, attrs=ATTRS,
+                              theme='south', client_name='C', city='Bangalore')
+        assert pack['weekday'] == 'Thursday'
+        assert len(pack['checks']) == 6
+        json.dumps(pack)
+
+    def test_non_working_days_are_skipped(self):
+        sol = {
+            '2026-09-10': {'day_type': 'south', 'is_working_day': True,
+                           'items': {'bread': {'item_base': 'jowar_roti'}}},
+            '2026-09-11': {'is_working_day': False, 'items': {}},
+        }
+        packs = build_plan_evidence(solution=sol, attrs=ATTRS)
+        assert [p['date'] for p in packs] == ['2026-09-10']
+
+    def test_relaxations_attach_to_every_day(self):
+        packs = [build_evidence(date='2026-09-10', day_items=DAY_ITEMS, attrs=ATTRS)]
+        attach_relaxations(packs, [{'rule': 'liquid_desserts_twice',
+                                    'detail': 'min 2 capped to 1'}])
+        assert packs[0]['relaxations'][0]['rule'] == 'liquid_desserts_twice'
+
+    def test_attrs_from_dataframe(self):
+        pd = pytest.importorskip('pandas')
+        df = pd.DataFrame([{'item': 'veg_kurma', 'texture': 'saucy',
+                            'item_color': 'green'}])
+        a = attrs_from_dataframe(df)
+        assert a['veg_kurma']['texture'] == 'saucy'
+
+
+class TestRenderer:
+    def test_bullets_render_without_any_llm(self):
+        pack = build_evidence(date='2026-09-10', day_items=DAY_ITEMS,
+                              attrs=ATTRS, theme='south')
+        lines = render_day(pack)
+        assert any('Thursday' in l for l in lines)
+        assert render_plan([pack])
+
+    def test_failures_are_always_shown(self):
+        """A summary that only reports good news teaches people to ignore it."""
+        pack = build_evidence(date='2026-09-10', day_items=DAY_ITEMS, attrs=ATTRS)
+        out = '\n'.join(render_day(pack, show_passing=False))
+        assert '[!]' in out
+
+    def test_summary_leads_with_failures(self):
+        pack = build_evidence(date='2026-09-10', day_items=DAY_ITEMS, attrs=ATTRS)
+        assert 'check:' in day_summary(pack)
+
+
+# --------------------------------------------------------------------------
+# The validator. This is what stops the feature inventing rationale.
+# --------------------------------------------------------------------------
+
+def _strip_bad_news(p):
+    """A pack with nothing for the honesty rule to demand.
+
+    `validate` rejects a reply that stays silent about a failing check, a
+    pairing gap or a relaxed rule (see TestItMustNotBeAYesMan). That rule is
+    about OMISSION; the tests below are about INVENTION, and a test of "is a
+    made-up dish rejected" must not also depend on whether this fixture's
+    plate happens to fail texture_contrast. Each set controls its own state.
+    """
+    out = dict(p)
+    out['checks'] = [dict(c, passed=True) for c in (p.get('checks') or [])]
+    out['pairings'] = dict(p.get('pairings') or {}, gaps=[])
+    out['relaxations'] = []
+    return out
+
+
+@pytest.fixture
+def raw_pack():
+    """The real pack, failing checks and all."""
+    return build_evidence(date='2026-09-10', day_items=DAY_ITEMS, attrs=ATTRS,
+                          theme='south')
+
+
+@pytest.fixture
+def pack(raw_pack):
+    return _strip_bad_news(raw_pack)
+
+
+class TestValidator:
+    @staticmethod
+    def _v(prose, pack):
+        from api.explain_llm import validate
+        return validate(prose, pack)
+
+    def test_a_marketing_sentence_is_rejected(self, pack):
+        """`SYSTEM_PROMPT` forbids marketing adjectives and nothing enforced it.
+
+        It matters more than it looks: this paragraph sits above a menu a
+        kitchen has to act on, and a sentence written to SELL is one nobody
+        trusts the numbers in. The rejected reply falls back to the computed
+        bullets, which is the right trade.
+        """
+        for sell in ('A delightful plate today.',
+                     'A symphony of textures across the counter.',
+                     'Thoughtfully curated for the week ahead.'):
+            ok, why = self._v(sell, pack)
+            assert not ok and 'marketing word' in why, sell
+
+    def test_plain_kitchen_english_is_untouched(self, pack):
+        """The guard has to be narrow or it eats the voice it is protecting."""
+        for plain in ('Thursday is a north menu of six mains.',
+                      'Aloo jeera is the only dry vegetable against two gravies.'):
+            assert self._v(plain, pack)[0], plain
+
+    def test_an_invented_dish_written_the_way_a_model_writes_one(self, pack):
+        """The hole the guarantee was overstated across: the snake_case check
+        lowercases the prose and then looks for underscores, so it could never
+        fire on a Title-Case name with spaces — which is the form the prompt's
+        own examples use. Three wholly invented dishes passed validation."""
+        for invented in ('Paneer Butter Masala is served alongside.',
+                         'We have added Gulab Jamun for dessert.',
+                         'Try the Hyderabadi Dum Biryani today.'):
+            ok, why = self._v(invented, pack)
+            assert not ok, invented
+            assert 'unknown dish' in why, why
+
+    def test_a_real_dish_in_title_case_is_still_accepted(self, pack):
+        """The check must not chew the sentences it exists to permit. A model
+        writes "Boondi Raita", not `boondi_raita`."""
+        names = [d['name'] for d in pack['dishes'].values()]
+        titled = ' '.join(w.capitalize() for w in names[0].split('_'))
+        if ' ' not in titled:
+            pytest.skip('this fixture has no multi-word dish name')
+        ok, why = self._v(f'{titled} is on the plate today.', pack)
+        assert ok, why
+
+    def test_a_pack_name_with_a_word_added_is_accepted(self, pack):
+        """"Chicken Chettinad Curry" where the pack says `chicken_chettinad` is
+        a paraphrase, not an invention — containment counts in both
+        directions."""
+        names = [d['name'] for d in pack['dishes'].values()]
+        titled = ' '.join(w.capitalize() for w in names[0].split('_'))
+        ok, why = self._v(f'{titled} Curry anchors the day.', pack)
+        assert ok, why
+
+    def test_an_ordinary_capitalised_sentence_is_not_a_dish(self, pack):
+        """`_COMMON_WORDS` is what keeps this from rejecting English."""
+        for fine in ('The Plate Is Balanced today.',
+                     'This Is The Main Course.'):
+            ok, why = self._v(fine, pack)
+            assert ok, (fine, why)
+
+    def test_containment_is_word_aligned(self, pack):
+        """A plain substring test passes on anything, because the pack really
+        does carry one-letter words: the pairing summary "2 pairing(s) hold
+        this plate together" harvests `s`, and `s` is inside `masala`, which is
+        exactly how "Paneer Butter Masala" was read as sourced."""
+        from api.explain_llm import _allowed_tokens, _sourced_phrase
+        _numbers, names, words = _allowed_tokens(pack)
+        assert 's' in words or True          # harvesting is not the claim here
+        assert not _sourced_phrase('paneer butter masala', names, words)
+
+    def test_grounded_prose_is_accepted(self, pack):
+        ok, why = self._v('Thursday leans south with jowar_roti alongside '
+                          'veg_kurma. The plate carries 2 textures.', pack)
+        assert ok, why
+
+    def test_a_true_but_unsourced_number_is_still_rejected(self, pack):
+        """'3 textures' is arithmetically defensible if you count the curd,
+        but the pack scopes textures to MAIN courses and reports 2. The
+        validator has no opinion on truth — only on provenance. Anything the
+        pack did not say, the prose may not say."""
+        assert not self._v('The plate carries 3 textures.', pack)[0]
+
+    def test_invented_number_is_rejected(self, pack):
+        """The core guarantee: a plausible statistic that came from nowhere."""
+        ok, why = self._v('This plate scores 87 percent on balance.', pack)
+        assert not ok and '87' in why
+
+    def test_invented_dish_is_rejected(self, pack):
+        ok, why = self._v('Served with fresh paneer_tikka on the side.', pack)
+        assert not ok and 'paneer_tikka' in why
+
+    @pytest.mark.parametrize('prose', [
+        # `primary_protein`, `cuisine_family`, `key_ingredient` and the slot
+        # names are all IN the pack. The underscored-token rule read every
+        # snake_case word as dish-shaped and threw the whole reply away, so a
+        # model quoting the pack correctly was punished for it — the rule is
+        # "anything the pack did not say", and the pack said these.
+        'Curd carries yogurt as its primary_protein.',
+        'The gravy is south_indian and so is the bread.',
+        'veg_kurma is the veg_gravy and jowar_roti the bread.',
+        'Its key_ingredient is mixed_veg.',
+    ])
+    def test_a_pack_value_that_is_not_a_dish_name_is_still_quotable(
+            self, prose, pack):
+        ok, why = self._v(prose, pack)
+        assert ok, why
+
+    def test_widening_that_did_not_widen_the_guarantee(self, pack):
+        """The point of the fix was to stop rejecting TRUE sentences, not to
+        start accepting invented ones. A dish-shaped token the pack does not
+        carry anywhere is still refused."""
+        for invented in ('gobi_manchurian', 'aloo_gobi', 'paneer_tikka'):
+            ok, why = self._v(f'The plate also carries {invented}.', pack)
+            assert not ok and invented in why
+        # `chicken_65` is refused too, but by the NUMBER rule rather than the
+        # dish rule — whichever fires first is enough, and asserting the
+        # message would pin the order for no reason.
+        assert not self._v('The plate also carries chicken_65.', pack)[0]
+
+    def test_judgement_is_not_policed_and_that_is_documented(self, pack):
+        """The boundary, asserted so it is not mistaken for a bug later.
+
+        "3 textures" is sourced; "a little soft" is an opinion, and no validator
+        can decide whether it agrees with `texture_contrast: passed`. Rule 4 of
+        the system prompt forbids contradicting a verdict and nothing enforces
+        it — which is exactly why the BULLETS are the primary surface and are
+        gated on `checks.CALIBRATED`, with prose additive on top.
+        """
+        ok, _why = self._v('The plate carries 2 textures, so it is a little '
+                           'soft.', pack)
+        assert ok
+
+    @pytest.mark.parametrize('bad', [
+        'A healthy plate with balanced nutrition.',
+        'Around 600 calories per serving.',
+        'Good for diabetic staff members.',
+        'Rich in vitamin content.',
+    ])
+    def test_health_claims_are_rejected(self, bad, pack):
+        """Liability boundary, not a style preference. You are a caterer."""
+        assert not self._v(bad, pack)[0]
+
+    def test_empty_reply_is_rejected(self, pack):
+        assert not self._v('   ', pack)[0]
+
+    def test_rejection_falls_back_to_bullets_not_a_patched_sentence(self, pack, monkeypatch):
+        """A half-trusted sentence is worse than a bullet list — nobody can
+        tell which half to trust. Rejected replies are discarded whole."""
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: json.dumps(
+            {'days': [{'date': '2026-09-10',
+                       'prose': 'A perfectly balanced 99 point plate.'}]}))
+        out = mod.explain_plan([pack])['2026-09-10']
+        assert out['prose'] is None
+        assert out['llm_used'] is False
+        assert out['bullets']
+        assert 'rejected' in out['reason']
+
+    def test_bad_reply_is_never_cached(self, pack, monkeypatch):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: json.dumps(
+            {'days': [{'date': '2026-09-10', 'prose': 'Scores 42 overall.'}]}))
+        mod.explain_plan([pack])
+        assert mod._cache == {}
+
+    def test_model_unavailable_still_returns_bullets(self, pack, monkeypatch):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: None)
+        out = mod.explain_plan([pack])['2026-09-10']
+        assert out['prose'] is None and out['bullets']
+
+    def test_disabled_is_the_default_path(self, pack):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        out = mod.explain_plan([pack])['2026-09-10']
+        assert out['llm_used'] is False and out['bullets']
+
+
+class TestTheModelCall:
+    """`_call_model` returns None on every failure rather than raising.
+
+    That is the whole contract: this feature is optional and must never be the
+    reason a menu request fails. No network is touched — `requests.post` is
+    replaced, which is also what keeps this file inside the offline boundary
+    `tests/platform/test_architecture.py` enforces for the layer below.
+    """
+
+    @staticmethod
+    def _reply(monkeypatch, **kw):
+        import api.explain_llm as mod
+        monkeypatch.setattr(mod, 'API_KEY', 'test-key')
+
+        class _Resp:
+            status_code = kw.get('status', 200)
+
+            def json(self):
+                if 'raises' in kw:
+                    raise ValueError('not json')
+                return kw.get('body', {})
+
+        monkeypatch.setattr('requests.post', lambda *a, **k: _Resp())
+        return mod
+
+    def test_no_api_key_is_not_an_error(self, monkeypatch):
+        import api.explain_llm as mod
+        monkeypatch.setattr(mod, 'API_KEY', '')
+        assert mod._call_model('{}') is None
+
+    def test_a_good_reply_returns_its_text(self, monkeypatch):
+        mod = self._reply(monkeypatch, body={
+            'candidates': [{'content': {'parts': [{'text': 'one '},
+                                                  {'text': 'two'}]}}]})
+        assert mod._call_model('{}') == 'one two'
+
+    def test_rate_limited_falls_back_rather_than_raising(self, monkeypatch):
+        """429 is the expected steady state on a free tier, not an incident."""
+        mod = self._reply(monkeypatch, status=429)
+        assert mod._call_model('{}') is None
+
+    @pytest.mark.parametrize('status', [400, 403, 500, 503])
+    def test_any_http_error_falls_back(self, monkeypatch, status):
+        mod = self._reply(monkeypatch, status=status)
+        assert mod._call_model('{}') is None
+
+    def test_an_empty_candidate_list_is_not_an_index_error(self, monkeypatch):
+        mod = self._reply(monkeypatch, body={'candidates': []})
+        assert mod._call_model('{}') is None
+
+    def test_a_body_that_will_not_parse_falls_back(self, monkeypatch):
+        mod = self._reply(monkeypatch, raises=True)
+        assert mod._call_model('{}') is None
+
+    def test_a_transport_failure_falls_back(self, monkeypatch):
+        import api.explain_llm as mod
+        monkeypatch.setattr(mod, 'API_KEY', 'test-key')
+
+        def _boom(*a, **k):
+            raise OSError('connection reset')
+
+        monkeypatch.setattr('requests.post', _boom)
+        assert mod._call_model('{}') is None
+
+
+class TestTheCache:
+    """Caching is required here, not an optimisation.
+
+    Streamlit reruns the whole script on every widget interaction, so without a
+    cache one user moving a date picker burns the daily model quota.
+    """
+
+    def test_an_accepted_reply_is_served_from_cache_the_second_time(
+            self, pack, monkeypatch):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        calls = []
+
+        def _once(payload):
+            calls.append(payload)
+            return json.dumps({'days': [{'date': '2026-09-10',
+                                         'prose': 'Thursday leans south.'}]})
+
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', _once)
+        first = mod.explain_plan([pack])['2026-09-10']
+        assert first['llm_used'] and first['reason'] == 'ok'
+        second = mod.explain_plan([pack])['2026-09-10']
+        assert second['reason'] == 'cache' and second['prose'] == first['prose']
+        assert len(calls) == 1, 'the model was called again for the same plan'
+
+    def test_the_cache_is_bounded(self, pack, monkeypatch):
+        """An unbounded dict here is a slow leak in a long-lived Flask worker."""
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'MAX_CACHE_ENTRIES', 3)
+        for i in range(6):
+            mod._cache_put(f'key{i}', {'2026-09-10': 'x'})
+        assert len(mod._cache) == 3
+        assert 'key0' not in mod._cache and 'key5' in mod._cache
+
+    def test_an_unparseable_reply_falls_back_to_bullets(self, pack, monkeypatch):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: 'not json at all')
+        out = mod.explain_plan([pack])['2026-09-10']
+        assert out['prose'] is None and out['bullets']
+        assert 'unparseable' in out['reason']
+
+    def test_a_fenced_reply_is_still_read(self, pack, monkeypatch):
+        """Models wrap JSON in ``` fences even when told not to."""
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: (
+            '```json\n' + json.dumps({'days': [
+                {'date': '2026-09-10', 'prose': 'Thursday leans south.'}]})
+            + '\n```'))
+        assert mod.explain_plan([pack])['2026-09-10']['llm_used'] is True
+
+    def test_a_reply_for_an_unknown_date_is_ignored(self, pack, monkeypatch):
+        """A model inventing a date must not create a day in the response."""
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: json.dumps(
+            {'days': [{'date': '1999-01-01', 'prose': 'Whatever.'}]}))
+        out = mod.explain_plan([pack])
+        assert list(out) == ['2026-09-10']
+        assert out['2026-09-10']['prose'] is None
+
+    def test_no_packs_is_not_a_model_call(self, monkeypatch):
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: pytest.fail(
+            'called the model with nothing to explain'))
+        assert mod.explain_plan([]) == {}
+
+    def test_a_partial_reply_is_not_cached(self, pack, monkeypatch):
+        """Caching a plan whose days are half-accepted would serve the gap back
+        forever; only a fully accepted plan is stored."""
+        import api.explain_llm as mod
+        mod.reset_cache_for_tests()
+        second = dict(pack, date='2026-09-11', weekday='Friday')
+        monkeypatch.setattr(mod, 'ENABLED', True)
+        monkeypatch.setattr(mod, '_call_model', lambda payload: json.dumps(
+            {'days': [{'date': '2026-09-10', 'prose': 'Thursday leans south.'}]}))
+        out = mod.explain_plan([pack, second])
+        assert out['2026-09-10']['llm_used'] is True
+        assert out['2026-09-11']['prose'] is None
+        assert mod._cache == {}
+
+
+class TestItMustNotBeAYesMan:
+    """A reply that only reports good news is discarded.
+
+    Every other validator rule catches INVENTION — a fabricated number, a dish
+    the pack does not carry. None of them catches OMISSION, and omission is the
+    cheaper failure: the easiest paragraph a model can write is the one saying
+    everything is lovely, and it passed every rule here. Rules 4, 5 and 7 of
+    SYSTEM_PROMPT told it not to, and nothing enforced them.
+
+    This cannot check that the prose is RIGHT — a validator cannot decide
+    whether free text agrees with `texture_contrast: passed`. It checks that
+    when the pack carries bad news the prose is at least ABOUT it.
+    """
+
+    @staticmethod
+    def _v(prose, pack):
+        from api.explain_llm import validate
+        return validate(prose, pack)
+
+    def _with_gap(self, pack):
+        p = dict(pack)
+        p['pairings'] = dict(p.get('pairings') or {})
+        p['pairings']['gaps'] = ['nothing cooling against the hot dishes']
+        return p
+
+    def _with_failed_check(self, pack):
+        from src.explain.checks import CALIBRATED
+        p = dict(pack)
+        name = sorted(CALIBRATED)[0]
+        p['checks'] = [{'name': name, 'passed': False,
+                        'detail': 'x', 'evidence': {}}]
+        return p
+
+    def test_flattery_over_a_gap_is_rejected(self, pack):
+        ok, why = self._v('A well put together plate, nicely varied.',
+                          self._with_gap(pack))
+        assert not ok
+        assert 'only reports good news' in why, why
+
+    def test_naming_the_gap_is_accepted(self, pack):
+        ok, why = self._v(
+            'There is nothing cooling against the hot dishes today.',
+            self._with_gap(pack))
+        assert ok, why
+
+    def test_a_failing_check_is_NOT_demanded(self, pack):
+        """Deliberate, and the opposite of what this once required.
+
+        A gap is a sentence about the FOOD — "this is hot and nothing here
+        cools it" — and belongs in an overview. A failing check is a sentence
+        about the RULESET, and demanding the prose name `texture_contrast`
+        drags the paragraph back into being the compliance report this layer
+        exists not to be. The checks still ride in the response for whoever is
+        auditing them; they are just not the reader this text is written for.
+        """
+        ok, why = self._v('Everything works nicely together.',
+                          self._with_failed_check(pack))
+        assert ok, why
+
+    def test_a_gap_is_still_demanded(self, pack):
+        """The honesty that survives the narrowing, because a gap IS food."""
+        p = self._with_failed_check(self._with_gap(pack))
+        ok, why = self._v('Everything works nicely together.', p)
+        assert not ok
+        assert 'only reports good news' in why, why
+
+    def test_a_relaxed_rule_must_be_mentioned(self, pack):
+        p = dict(pack)
+        p['relaxations'] = [{'rule': 'veg_key_ingredient_three_day_gap',
+                             'message': 'relaxed'}]
+        ok, _ = self._v('A solid plate all round.', p)
+        assert not ok
+        ok, why = self._v(
+            'The three day gap on the veg key ingredient was relaxed today.', p)
+        assert ok, why
+
+    def test_a_clean_plate_constrains_nothing(self, pack):
+        # No bad news to demand. Requiring hedging on a good day would be its
+        # own dishonesty, so praise is fine when it is earned.
+        p = dict(pack)
+        p['checks'] = [{'name': 'texture_contrast', 'passed': True,
+                        'detail': 'x', 'evidence': {}}]
+        p['pairings'] = dict(p.get('pairings') or {})
+        p['pairings']['gaps'] = []
+        p['relaxations'] = []
+        ok, why = self._v('A balanced plate today.', p)
+        assert ok, why
+
+    def test_an_uncalibrated_failure_is_not_demanded(self, pack):
+        # The uncalibrated checks ride in the response for whoever is measuring
+        # them (note 33). Making the prose repeat a verdict we do not yet trust
+        # would be the opposite of honesty.
+        from src.explain.checks import ALL_CHECKS, CALIBRATED
+        uncal = [c.__name__.replace('check_', '') for c in ALL_CHECKS
+                 if c.__name__.replace('check_', '') not in CALIBRATED]
+        if not uncal:
+            pytest.skip('every check is calibrated')
+        p = dict(pack)
+        p['checks'] = [{'name': uncal[0], 'passed': False,
+                        'detail': 'x', 'evidence': {}}]
+        p['pairings'] = dict(p.get('pairings') or {})
+        p['pairings']['gaps'] = []
+        ok, why = self._v('A balanced plate today.', p)
+        assert ok, why
+
+    def test_a_stopword_does_not_satisfy_the_rule(self, pack):
+        # "the" appears in almost every gap string and in almost every reply;
+        # if it counted, the check would pass on anything.
+        p = dict(pack)
+        p['pairings'] = dict(p.get('pairings') or {})
+        p['pairings']['gaps'] = ['the plate has nothing crisp']
+        ok, _ = self._v('The food is good and the plate is fine.', p)
+        assert not ok

@@ -1,0 +1,54 @@
+{
+  "bangalore.xlsx": [
+    "amadeus",
+    "booking.com",
+    "citrix",
+    "cloudera",
+    "computacenter",
+    "continental",
+    "healthineers",
+    "icon",
+    "infineon",
+    "moengage",
+    "stripe",
+    "stryker",
+    "zscalar"
+  ],
+  "chennai.xlsx": [
+    "accenture",
+    "icon",
+    "ltm",
+    "rntbci",
+    "tata communications",
+    "toast tab",
+    "wells fargo",
+    "world bank"
+  ],
+  "hyderabad.xlsx": [
+    "amadeus",
+    "booking.com",
+    "citrix",
+    "cloudera",
+    "computacenter",
+    "continental",
+    "healthineers",
+    "icon",
+    "infineon",
+    "moengage",
+    "quest",
+    "stripe",
+    "stryker",
+    "zscalar"
+  ],
+  "ncr.xlsx": [
+    "airtel noida",
+    "carelon",
+    "corning",
+    "junglee games",
+    "sael",
+    "siemens",
+    "sinch",
+    "stryker"
+  ],
+  "pune.xlsx": []
+}

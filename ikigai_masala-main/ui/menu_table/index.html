@@ -1,0 +1,876 @@
+<!doctype html>
+<meta charset="utf-8">
+<!--
+  The menu table, as a Streamlit component.
+
+  Streamlit cannot express this table: every cell is an individually
+  selectable button carrying a colour dot, a pin, a warning and a
+  "changed" marker, and the selection drives "Regenerate selected".
+  st.markdown renders it but returns nothing, and a widget per cell is
+  9 rows x 5 days x 2 services = 90 buttons and a rerun per click.
+
+  Deliberately a STATIC component: no npm, no bundler, no node in the
+  repo. It talks to Streamlit over the documented postMessage protocol
+  directly, which is ~40 lines of the JS below. The cost is that there
+  is no JSX and no hot reload; the benefit is that `pip install` is
+  still the whole toolchain.
+-->
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: transparent; }
+
+  .panel { background: #FFFFFF; border: 1px solid #E5E5E5; border-radius: 14px;
+           box-shadow: 0 1px 3px rgba(19,19,19,0.05); overflow: hidden; }
+
+  .bar { display: flex; align-items: center; justify-content: space-between;
+         gap: 12px; padding: 12px 16px; min-height: 34px; }
+  .bar .name { font-size: 16px; font-weight: 800; color: #131313; }
+  .bar .meta { font-size: 12px; color: #777777; margin-left: 10px; }
+  .bar .sel  { font-size: 12.5px; font-weight: 700; color: #0A58CA; }
+
+  .btn { border-radius: 8px; font-family: inherit; cursor: pointer;
+         font-size: 12.5px; font-weight: 600; padding: 7px 12px;
+         background: #FFFFFF; color: #131313; border: 1px solid #E5E5E5;
+         transition: background-color .18s ease, border-color .18s ease,
+                     color .18s ease, box-shadow .18s ease, transform .18s ease; }
+  .btn:hover:not(:disabled) { filter: brightness(0.97); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid #0D6EFD; outline-offset: 2px; }
+  .btn.primary { background: #FEBF34; border-color: #FEBF34; font-weight: 700; padding: 7px 14px; }
+
+  /* Pick mode. The results panel sits IN THE FLOW under the edited row
+     rather than floating: the component lives in an iframe sized to its
+     content, so an absolutely positioned panel is clipped at the iframe
+     edge and the planner sees half a list. */
+  .seg { display: inline-flex; border: 1px solid #E5E5E5; border-radius: 8px; overflow: hidden; }
+  .seg button { font-family: inherit; font-size: 12.5px; font-weight: 600;
+                padding: 6px 14px; border: 0; background: #FFFFFF;
+                color: #414141; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: #131313; color: #FFFFFF; }
+  .seg button:focus-visible { outline: 2px solid #0D6EFD; outline-offset: -2px; }
+
+  .status { padding: 7px 16px; font-size: 12.5px; color: #414141;
+            background: #F9F9F9; border-top: 1px solid #F0F0F0; }
+  .status.err { background: #FFF1F2; color: #9B1C24; }
+
+  .cell input.q { width: 100%; font-family: inherit; font-size: 12.5px;
+                  padding: 5px 7px; border: 1px solid #0D6EFD; border-radius: 6px;
+                  outline: none; background: #FFFFFF; color: #131313; }
+
+  .res { border-top: 1px solid #E5E5E5; background: #FFFFFF; padding: 8px 12px 10px; }
+  .res .rhead { display: flex; justify-content: space-between; gap: 12px;
+                flex-wrap: wrap; font-size: 12px; color: #777777; padding-bottom: 6px; }
+  .res .rhead b { color: #131313; font-weight: 700; }
+  .res ul { list-style: none; margin: 0; padding: 0; }
+  .res li { display: flex; align-items: center; gap: 8px; min-height: 44px;
+            padding: 4px 8px; border-radius: 8px; cursor: pointer;
+            font-size: 12.5px; color: #131313; }
+  .res li[aria-selected="true"] { background: #EBF3FF; box-shadow: inset 0 0 0 2px #0D6EFD; }
+  .res li[aria-disabled="true"] { cursor: default; color: #777777; }
+  .res li .nm { flex: 1; }
+  .chip { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 99px;
+          white-space: nowrap; }
+  .chip.ok   { background: #E5FFF1; color: #137A43; }
+  .chip.warn { background: #FFF5E8; color: #A35800; }
+  .chip.lock { background: #F0F0F0; color: #555555; }
+  .res .none { font-size: 12.5px; color: #777777; padding: 8px; }
+
+  .exc { border-top: 1px solid #E5E5E5; }
+  .exc > button { width: 100%; display: flex; align-items: center; gap: 8px;
+                  padding: 10px 16px; background: #FFFBF2; border: 0;
+                  font-family: inherit; font-size: 13px; font-weight: 700;
+                  color: #131313; cursor: pointer; text-align: left; }
+  .exc .count { background: #F78D00; color: #FFFFFF; border-radius: 99px;
+                font-size: 11px; padding: 1px 8px; }
+  .exc .body { padding: 4px 16px 12px; }
+  .exc .item { border: 1px solid #F0F0F0; border-radius: 10px; padding: 9px 11px;
+               margin-bottom: 8px; }
+  .exc .item h5 { margin: 0 0 3px; font-size: 13px; font-weight: 700; color: #131313; }
+  .exc .item .sub { font-size: 11.5px; color: #777777; margin-bottom: 6px; }
+  .exc .v { font-size: 12px; color: #414141; padding: 2px 0; }
+  .exc .v b { color: #131313; }
+  .exc .cover { font-size: 11.5px; color: #777777; padding-top: 4px; line-height: 1.5; }
+
+  .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+        overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+  .grid { display: grid; border-top: 1px solid #131313; }
+  .head { background: #000000; color: #FFFFFF; padding: 10px 12px;
+          font-size: 12px; font-weight: 700; display: flex; align-items: flex-end; }
+  .day  { background: #131313; padding: 10px 8px; display: flex;
+          flex-direction: column; align-items: center; gap: 6px;
+          border-left: 1px solid #2A2A2A; }
+  .day .lbl { display: flex; align-items: center; gap: 6px; font-size: 13px;
+              font-weight: 700; color: #FFFFFF; }
+  .dot-issue { width: 7px; height: 7px; border-radius: 50%; background: #F78D00; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px;
+          font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.04em; align-self: flex-start; }
+  /* `.day` stacks its children, so a day carrying both a theme and a region
+     put one pill under the other and made the column taller than its
+     neighbours. They belong on one line: the day is a North day AND a
+     Maharashtra day, not two facts in sequence. Wraps rather than squeezes,
+     because a narrow column with two long names has nowhere else to go. */
+  .day .pills { display: flex; flex-wrap: wrap; gap: 5px; align-self: flex-start; }
+  .why  { background: transparent; border: 1px solid rgba(255,255,255,0.35);
+          color: #FFFFFF; border-radius: 99px; font-size: 11px;
+          font-weight: 700; padding: 4px 10px;
+          font-family: inherit; cursor: pointer; }
+  /* Open reads as a pressed control, not a second way of saying the same
+     thing — the row above it is black, so an outline alone barely changes. */
+  .why.open { background: #FEBF34; color: #131313; border-color: #FEBF34; }
+
+  .slot { background: #F9F9F9; padding: 8px 12px; font-size: 11.5px;
+          font-weight: 600; color: #414141; border-right: 1px solid #131313;
+          display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+  .slot .shared { font-size: 9.5px; font-weight: 700; color: #0A58CA;
+                  text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .cell { display: flex; align-items: center; gap: 6px; width: 100%;
+          min-width: 0; padding: 8px 10px; border: none;
+          border-left: 1px solid #131313; text-align: left;
+          font-family: inherit; cursor: pointer; min-height: 38px;
+          transition: background-color .18s ease; }
+  .cell:focus-visible { outline: 2px solid #0D6EFD; outline-offset: -2px; }
+  .cell.off { background: #F9F9F9; color: #AEAEAE; cursor: default;
+              font-size: 12.5px; }
+  /* A pinned cell is fixed by a rule, so regenerating it would hand back the
+     same dish. Not selectable, and the cursor says so before the click. */
+  .cell.pinned { cursor: not-allowed; }
+  /* The SWATCH. White needs an outline or it is an invisible hole in a white
+     cell — the one colour that cannot be drawn as itself unaided. */
+  .cell .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+               box-sizing: border-box; }
+  .cell .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+              font-size: 12.5px; line-height: 1.3; color: #131313;
+              font-weight: 500; }
+  /* Non-veg is the one thing in a cell worth reading before the dish name.
+     Red here is unambiguous because the colour itself lives in the dot. */
+  .cell.nonveg .nm { color: #C40D1B; font-weight: 700; }
+  /* The regional marker: a filled disc with a white R, at the cell's right
+     edge. A regional day is a floor rather than a filter, so the rest of the
+     day's dishes are ordinary and nothing but this says which ones the region
+     bought — it has to carry that across a wide table at a glance, which is
+     why it is the strongest mark in the cell rather than the header pill's
+     amber. The header has room to name the region in words; this has one
+     letter, and needed the contrast more than the colour match. */
+  .cell .rgn { margin-left: auto; flex-shrink: 0; width: 16px; height: 16px;
+               border-radius: 50%; background: #131313; color: #FFFFFF;
+               font-size: 10px; font-weight: 700; line-height: 1;
+               display: flex; align-items: center; justify-content: center; }
+  .cell .tail { margin-left: auto; flex-shrink: 0; display: flex;
+                align-items: center; }
+  /* The R has already claimed the right edge, so a marker beside it takes an
+     ordinary gap. Two `auto` margins split the free space between them and
+     would strand the R in the middle of the cell. */
+  .cell .rgn + .tail { margin-left: 4px; }
+
+  .explain { display: grid; grid-template-columns: minmax(0,1.3fr) minmax(0,1fr);
+             gap: 18px; padding: 14px 16px; background: #FFFBF2;
+             border-top: 1px solid #131313; }
+  .explain h4 { margin: 0 0 5px; font-size: 11px; font-weight: 800; color: #131313;
+                text-transform: uppercase; letter-spacing: 0.06em; }
+  .explain p  { margin: 0; font-size: 13px; color: #414141; line-height: 1.6; }
+  .check { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px;
+           color: #131313; line-height: 1.45; margin-bottom: 7px; }
+  .mark  { width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+           display: flex; align-items: center; justify-content: center;
+           font-size: 10px; font-weight: 800; color: #FFFFFF; margin-top: 1px; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+<div id="root"></div>
+<script>
+(function () {
+  // --- the Streamlit component protocol, written out rather than imported ---
+  function post(type, extra) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*");
+  }
+  function setHeight() {
+    // Measure the CONTENT, not `document.documentElement`: `scrollHeight` can
+    // never report LESS than the iframe's own viewport, so a table that gets
+    // SHORTER — switching to a client with fewer slots — would be pinned at
+    // the taller measurement and leave a blank gap under itself. Python still
+    // passes an initial `height`, which masked this; measuring `#root` means
+    // the component is right on its own rather than by that arrangement.
+    // Same fix as `ui/region_strip/index.html`.
+    var root = document.getElementById("root");
+    post("streamlit:setFrameHeight", {height: Math.ceil(
+      root ? root.getBoundingClientRect().height
+           : document.documentElement.scrollHeight)});
+  }
+  function setValue(value) {
+    post("streamlit:setComponentValue", {value: value, dataType: "json"});
+  }
+
+  var ARGS = null;
+  // Selection and the open explain day live HERE, not in Streamlit: a rerun
+  // per click would make picking six cells cost six round trips.
+  var selected = [];
+  var openDay = null;
+  // Pick-mode state, all local. Typing must not cost a Streamlit rerun:
+  // the city list is embedded (ui/menu_table.dish_payload) precisely so the
+  // search runs here.
+  var mode = "auto";          // "auto" | "pick"
+  var pickCell = null;        // "<slot>|<iso>" being edited
+  var query = "";
+  var caret = 0;              // where the cursor was, to put it back
+  var highlight = 0;          // index into the SELECTABLE results
+  var applying = false;       // an Apply is in flight; ignore a second one
+  var status = "";
+  var statusErr = false;
+  // Dishes the SERVER refused as week repeats. The embedded list only knows
+  // the plan on screen, so a dish blocked by saved history comes back as a
+  // 400 — remembering it keeps the planner from picking it again and again.
+  var serverLocked = {};
+  var excOpen = true;
+
+  var THEME = {
+    mix: ["#E5FFF1", "#137A43"], chinese: ["#FFF5E8", "#A35800"],
+    biryani: ["#FFE7E9", "#C40D1B"], south: ["#EBF3FF", "#0A58CA"],
+    north: ["#F3ECFF", "#6F42C1"], continental: ["#E4F7F4", "#0F8E80"]
+  };
+  // Item colours arrive per cell as a spelled-out name and a readable
+  // foreground (ui/theme_tokens.ITEM_COLOR_MAP). Deliberately not a palette
+  // here: two copies of it drift, and the drifted one is the invisible error.
+
+  var ICON = {
+    pin: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M9 3h6l-1 6 4 3v2H6v-2l4-3-1-6zM12 14v7" stroke="#414141" stroke-width="2.2" stroke-linejoin="round"/></svg>',
+    tick: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="11" fill="#0D6EFD"/><path d="M7 12.5l3.2 3L17 9" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    warn: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M12 9v4m0 4h.01M10.3 3.9L2.5 17a2 2 0 001.7 3h15.6a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z" stroke="#A35800" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    pencil: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M4 20h4L19 9a2.8 2.8 0 10-4-4L4 16v4z" stroke="#6F42C1" stroke-width="2.2" stroke-linejoin="round"/></svg>',
+    redo: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 11-2.3-5.7M20 4v5h-5" stroke="#0A58CA" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    // The explain panel's verdict marks. Circled tick in green, matching the
+    // design; the warning reuses the cell's own triangle so one shape means
+    // "look at this" wherever it appears.
+    tickOk: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" style="flex-shrink:0"><circle cx="12" cy="12" r="11" fill="#1AA45B"/><path d="M7 12.5l3.2 3L17 9" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+  };
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
+    });
+  }
+  function key(rowId, iso) { return rowId + "|" + iso; }
+
+  // ---- Pick mode helpers -------------------------------------------------
+
+  function pretty(name) {
+    // The display name the server would have sent. Derived rather than
+    // transmitted: sending it doubled the embedded list (342 KiB against
+    // 106 KiB for the fleet's widest counter) and Streamlit resends every
+    // argument on every rerun. Mirrors ui.formatters._prettify_item_name.
+    return String(name || "").replace(/_/g, " ").trim()
+      .replace(/\S+/g, function (w) { return w.charAt(0).toUpperCase() + w.slice(1); });
+  }
+
+  function baseSlot(slotId) { return String(slotId || "").split("__")[0]; }
+
+  function isoWeek(iso) {
+    // ISO-8601 week number (decision D6). Thursday decides the year, which
+    // is the whole reason this is not `Math.floor(dayOfYear / 7)`.
+    var d = new Date(iso + "T00:00:00Z");
+    if (isNaN(d)) return iso;
+    var day = (d.getUTCDay() + 6) % 7;            // Mon = 0
+    d.setUTCDate(d.getUTCDate() - day + 3);       // the week's Thursday
+    var year = d.getUTCFullYear();
+    var jan4 = new Date(Date.UTC(year, 0, 4));
+    var week = 1 + Math.round(
+      ((d - jan4) / 86400000 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
+    return year + "-W" + week;
+  }
+
+  function cellOf(k) {
+    var parts = String(k || "").split("|");
+    var row = (ARGS.rows || []).filter(function (r) { return r.id === parts[0]; })[0];
+    return {slot: parts[0], iso: parts[1], row: row,
+            cell: row ? (row.cells || {})[parts[1]] : null};
+  }
+
+  function weekUsedNames(iso, exceptKey) {
+    // {normalised dish: day label} for the ISO week of `iso`, from the plan on
+    // screen. The client half of decision D5 — a convenience, not the rule:
+    // the server checks saved history too and wins when they disagree.
+    var want = isoWeek(iso), used = {};
+    (ARGS.days || []).forEach(function (d) {
+      if (isoWeek(d.iso) !== want) return;
+      (ARGS.rows || []).forEach(function (r) {
+        if (key(r.id, d.iso) === exceptKey) return;
+        var c = (r.cells || {})[d.iso];
+        if (!c || c.off || !c.title) return;
+        used[norm(c.title)] = d.label;
+      });
+    });
+    return used;
+  }
+
+  function norm(name) {
+    return String(name || "").replace(/\s*\([A-Z]\)\s*$/, "").trim().toLowerCase();
+  }
+
+  function matches(q, display) {
+    // Every whitespace-separated token must be a substring. Deliberately not
+    // a fuzzy match: a planner types the dish they have already decided on,
+    // and a fuzzy list puts something else first.
+    var toks = q.toLowerCase().split(/\s+/).filter(Boolean);
+    var low = display.toLowerCase();
+    for (var i = 0; i < toks.length; i++) {
+      if (low.indexOf(toks[i]) === -1) return false;
+    }
+    return true;
+  }
+
+  function results() {
+    // [{name, display, warnings:[], locked:<day>|null}], selectable first.
+    if (!pickCell) return [];
+    var info = cellOf(pickCell);
+    var slotData = (ARGS.dishes || {})[baseSlot(info.slot)];
+    if (!slotData) return [];
+    var names = slotData.n || [];
+    var out = {}; (slotData.out || []).forEach(function (i) { out[i] = 1; });
+    var ago = slotData.ago || {};
+    var cooldown = +(ARGS.cooldown_days || 0);
+    var used = weekUsedNames(info.iso, pickCell);
+    var here = info.cell ? norm(info.cell.title) : "";
+    var q = query.trim();
+
+    var picked = [];
+    for (var i = 0; i < names.length; i++) {
+      var display = pretty(names[i]);
+      if (q && !matches(q, display)) continue;
+      var n = norm(names[i]);
+      if (n === here) continue;             // the dish already in the cell
+      var warn = [];
+      var days = ago[String(i)];
+      if (days !== undefined && cooldown && days < cooldown) {
+        warn.push("Served " + days + " days ago");
+      }
+      if (out[i]) warn.push("Not in this client's pool");
+      picked.push({name: names[i], display: display, warnings: warn,
+                   locked: serverLocked[n] || used[n] || null});
+      if (picked.length > 400) break;       // the cap below does the rest
+    }
+    var ql = q.toLowerCase();
+    picked.sort(function (a, b) {
+      var ap = a.display.toLowerCase().indexOf(ql) === 0 ? 0 : 1;
+      var bp = b.display.toLowerCase().indexOf(ql) === 0 ? 0 : 1;
+      if (ap !== bp) return ap - bp;
+      if (a.warnings.length !== b.warnings.length) {
+        return a.warnings.length - b.warnings.length;
+      }
+      return a.display.localeCompare(b.display);
+    });
+    var free = picked.filter(function (r) { return !r.locked; }).slice(0, 8);
+    var lock = picked.filter(function (r) { return r.locked; }).slice(0, 3);
+    return free.concat(lock);
+  }
+
+  function selectable() {
+    return results().filter(function (r) { return !r.locked; });
+  }
+
+  function colourDishes(text, iso) {
+    // The overview names the day's dishes; print each in the ink its own cell
+    // uses, so the sentence and the table agree about what colour a dish is.
+    // Escape FIRST and match on the escaped text, or a dish with an ampersand
+    // in its name would never match and, worse, the replacement would be the
+    // one place raw input reached the DOM.
+    var out = esc(text);
+    var seen = {};
+    (ARGS.rows || []).forEach(function (r) {
+      var c = (r.cells || {})[iso];
+      if (c && c.name && c.color_fg) seen[c.name] = c.color_fg;
+    });
+    // Longest first: "Aloo Gobi" must win over "Aloo", or the shorter match
+    // eats the front of the longer name and leaves "Gobi" bare.
+    Object.keys(seen).sort(function (a, b) { return b.length - a.length; })
+      .forEach(function (name) {
+        var safe = esc(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        // Guarded on BOTH sides: without the trailing `(?!\w)` a "Dal" cell
+        // paints the front of "Dalgona". The leading `[^>\w]` also keeps a
+        // name that directly follows a `>` out, which is what stops an
+        // already-wrapped name being wrapped again by a later pass.
+        out = out.replace(
+          new RegExp("(^|[^>\\w])(" + safe + ")(?!\\w)(?![^<]*>)", "gi"),
+          '$1<span style="color:' + esc(seen[name]) + ';font-weight:600">$2</span>');
+      });
+    return out;
+  }
+
+  function hasDishes() {
+    return !!(ARGS.dishes && Object.keys(ARGS.dishes).length);
+  }
+
+  function hasException(k) {
+    var parts = String(k).split("|");
+    return (ARGS.exceptions || []).some(function (e) {
+      return e.slot_id === parts[0] && e.date === parts[1];
+    });
+  }
+
+  function resultsHtml() {
+    var info = cellOf(pickCell);
+    var slotData = (ARGS.dishes || {})[baseSlot(info.slot)] || {};
+    var total = (slotData.n || []).length;
+    var day = (ARGS.days || []).filter(function (d) { return d.iso === info.iso; })[0] || {};
+    var rows = results();
+    var sel = selectable();
+    var h = ['<div class="res" id="resbox">'];
+    h.push('<div class="rhead"><span><b>' + esc(info.row ? info.row.label : info.slot) +
+           '</b> \u00b7 ' + esc(day.label || info.iso) + ' \u00b7 replacing ' +
+           esc(info.cell ? info.cell.name : "\u2014") + '</span>');
+    h.push('<span>Searching the ' + esc(ARGS.city || "city") + ' city list \u00b7 ' +
+           total + ' dishes</span></div>');
+    if (!rows.length) {
+      h.push('<div class="none">No ' +
+             esc((info.row ? info.row.label : info.slot).toLowerCase()) +
+             ' dish matches "' + esc(query) + '" in the city list.</div>');
+    } else {
+      h.push('<ul role="listbox" id="reslist">');
+      rows.forEach(function (r) {
+        var si = sel.indexOf(r);
+        var on = si !== -1 && si === highlight;
+        h.push('<li role="option" id="opt_' + esc(r.name) + '"' +
+               (r.locked ? ' aria-disabled="true"' : ' data-pick="' + esc(r.name) + '"') +
+               ' aria-selected="' + (on && !r.locked) + '">');
+        h.push('<span class="nm">' + esc(r.display) + '</span>');
+        if (r.locked) {
+          h.push('<span class="chip lock">Already on ' + esc(r.locked) +
+                 ' \u00b7 one per week</span>');
+        } else if (!r.warnings.length) {
+          h.push('<span class="chip ok">Fits</span>');
+        } else {
+          h.push('<span class="chip warn">' + esc(r.warnings[0]) +
+                 (r.warnings.length > 1 ? " +" + (r.warnings.length - 1) : "") +
+                 '</span>');
+        }
+        h.push('</li>');
+      });
+      h.push('</ul>');
+    }
+    h.push('<div class="none" style="padding:6px 8px 0">Enter applies \u00b7 ' +
+           'Esc cancels \u00b7 a pick may break rules and is listed under ' +
+           'Exceptions</div>');
+    h.push('</div>');
+    return h.join("");
+  }
+
+  function exceptionsHtml() {
+    var ex = ARGS.exceptions || [];
+    if (!ex.length) return "";
+    var h = ['<div class="exc">'];
+    h.push('<button data-act="exc" aria-expanded="' + excOpen + '">' +
+           (excOpen ? "\u25be" : "\u25b8") + ' Exceptions <span class="count">' +
+           ex.length + '</span><span style="margin-left:auto;font-weight:600;' +
+           'font-size:11.5px;color:#777777">Picked by you</span></button>');
+    if (excOpen) {
+      h.push('<div class="body">');
+      ex.forEach(function (e) {
+        var day = (ARGS.days || []).filter(function (d) { return d.iso === e.date; })[0] || {};
+        h.push('<div class="item"><h5>' + esc(pretty(e.item)) + '</h5>');
+        h.push('<div class="sub">' + esc(e.slot_id) + ' \u00b7 ' +
+               esc(day.label || e.date) + ' \u00b7 replaced ' +
+               esc(pretty(e.replaced)) + ' (auto)</div>');
+        (e.violations || []).forEach(function (v) {
+          h.push('<div class="v"><b>' + esc(v.rule || v.code) + '</b> \u2014 ' +
+                 esc(v.message) + '</div>');
+        });
+        var cell = e.slot_id + "|" + e.date;
+        if (undoFor(cell)) {
+          h.push('<button class="btn" style="margin-top:7px" data-undo="' +
+                 esc(cell) + '">Undo this pick</button>');
+        }
+        h.push('</div>');
+      });
+      // Required, not decorative. Weekly caps, slot composition and colour
+      // constraints live only inside the CP-SAT model, so a pick that breaks
+      // one does not appear above. A list that did not say so would read as
+      // complete.
+      var ck = (ARGS.checked || []).join(", ");
+      var nk = (ARGS.not_checked || []).join(", ");
+      if (ck || nk) {
+        h.push('<div class="cover">Checked: ' + esc(ck || "nothing") +
+               '. Not checked: ' + esc(nk || "nothing") + '.</div>');
+      }
+      h.push('</div>');
+    }
+    h.push('</div>');
+    return h.join("");
+  }
+
+  function render() {
+    if (!ARGS) return;
+    var days = ARGS.days || [], rows = ARGS.rows || [];
+    var cols = "130px repeat(" + days.length + ",minmax(0,1fr))";
+    var h = [];
+
+    h.push('<div class="panel">');
+
+    // header bar: name, meta, and the selection actions when anything is picked
+    h.push('<div class="bar"><div><span class="name">' + esc(ARGS.title) + '</span>');
+    if (ARGS.meta) h.push('<span class="meta">' + esc(ARGS.meta) + '</span>');
+    h.push('</div>');
+    h.push('<div style="display:flex;align-items:center;gap:10px;">');
+    if (mode === "auto" && selected.length) {
+      h.push('<span class="sel">' + selected.length + ' selected</span>' +
+             '<button class="btn" data-act="clear">Clear</button>' +
+             '<button class="btn primary" data-act="regen">Regenerate selected</button>');
+    } else if (ARGS.hint && mode === "auto") {
+      h.push('<span style="font-size:12.5px;color:#777777;">' + esc(ARGS.hint) + '</span>');
+    }
+    // The toggle is TABLE-level and always enabled. An earlier design made
+    // Pick act on "the one selected cell", which had no answer when several
+    // were selected.
+    var undoCell = lastUndoCell();
+    if (undoCell) {
+      h.push('<button class="btn" data-undo="' + esc(undoCell) + '">' +
+             'Undo last pick</button>');
+    }
+    if (hasDishes()) {
+      h.push('<span class="seg" role="group" aria-label="Cell action mode">' +
+             '<button data-mode="auto" aria-pressed="' + (mode === "auto") + '">Auto</button>' +
+             '<button data-mode="pick" aria-pressed="' + (mode === "pick") + '">Pick</button>' +
+             '</span>');
+    }
+    h.push('</div></div>');
+    if (status) {
+      h.push('<div class="status' + (statusErr ? ' err' : '') +
+             '" role="status" aria-live="polite">' + esc(status) + '</div>');
+    }
+
+    // day header row
+    h.push('<div class="grid" style="grid-template-columns:' + cols + '">');
+    h.push('<div class="head">Slot</div>');
+    days.forEach(function (d, i) {
+      var t = THEME[d.theme] || ["#F0F0F0", "#555555"];
+      h.push('<div class="day"><span class="lbl">' + esc(d.label) +
+             (d.has_issue ? '<span class="dot-issue" title="Something to look at"></span>' : '') +
+             '</span>');
+      h.push('<span class="pills">');
+      h.push('<span class="pill" style="background:' + t[0] + ';color:' + t[1] + '">' +
+             esc(d.theme_label || d.theme) + '</span>');
+      if (d.region) {
+        h.push('<span class="pill" style="background:#FFF6E3;color:#6B4E00;">' + esc(d.region) + '</span>');
+      }
+      h.push('</span>');
+      // Only for a day there is actually something to say about. Rendered
+      // unconditionally it was a control that toggled to "Hide" and opened
+      // nothing, because the panel below is guarded on the same lookup.
+      if (ARGS.explain && ARGS.explain[d.iso]) {
+        h.push('<button class="why' + (openDay === i ? ' open' : '') +
+               '" data-why="' + i + '" aria-expanded="' + (openDay === i) + '">' +
+               (openDay === i ? "Hide" : "Why this menu") + '</button>');
+      }
+      h.push('</div>');
+    });
+    h.push('</div>');
+
+    // the explain panel sits directly under the day it belongs to
+    if (openDay !== null && ARGS.explain && ARGS.explain[days[openDay].iso]) {
+      var ex = ARGS.explain[days[openDay].iso];
+      var iso = days[openDay].iso;
+      var head = days[openDay].label + (ARGS.meal ? " " + ARGS.meal : "");
+      h.push('<div class="explain"><div><h4>Why this menu · ' + esc(head) +
+             '</h4><p>' + colourDishes(ex.overview || "", iso) + '</p></div><div>');
+      (ex.checks || []).forEach(function (c) {
+        // Three marks, not two: a check that PASSED, one that flagged, and a
+        // note that is neither. Collapsing the third into a warning is how a
+        // panel ends up looking alarming about something nobody needs to act
+        // on, which is the fastest way to have it ignored.
+        var m = c.passed === false ? ["#C56A00", "!"]
+              : c.passed === true ? ["#1AA45B", "\u2713"] : ["#0A58CA", "i"];
+        h.push('<div class="check"><span class="mark" style="background:' +
+               m[0] + '">' + m[1] + '</span><span>' + esc(c.text) +
+               '</span></div>');
+      });
+      h.push('</div></div>');
+    }
+
+    // one grid row per slot
+    rows.forEach(function (r, ri) {
+      h.push('<div class="grid" style="grid-template-columns:' + cols + '">');
+      h.push('<div class="slot">' + esc(r.label) +
+             (r.shared ? '<span class="shared">Shared</span>' : '') + '</div>');
+      days.forEach(function (d, di) {
+        var c = (r.cells || {})[d.iso] || {};
+        var k = key(r.id, d.iso);
+        var on = selected.indexOf(k) !== -1;
+        if (c.off || !c.name) {
+          h.push('<div class="cell off">' + esc(c.name || "—") + '</div>');
+          return;
+        }
+        // One background, decided in one place. Ordered by how much the
+        // reader needs it: what they just picked, then what needs looking at,
+        // then what changed, then the day they opened, then the zebra that
+        // only has to make a long row followable.
+        var bg = on ? "#EBF3FF"
+               : c.warn ? "#FFF5E8"
+               : (c.manual && hasException(k)) ? "#FFF5E8"
+               : c.manual ? "#F3ECFF"
+               : c.modified ? "#EBF3FF"
+               : (openDay === di ? "#FFFBF2" : (ri % 2 ? "#F9F9F9" : "#FFFFFF"));
+        var st = "background:" + bg + (on ? ";box-shadow:inset 0 0 0 2px #0D6EFD" : "");
+        if (pickCell === k) {
+          // The cell IS the search input (decision D1). Rendered as a plain
+          // div so the input is not nested in a button.
+          h.push('<div class="cell" style="background:#FFFFFF">' +
+                 '<label class="sr" for="q_' + esc(k) + '">Search ' +
+                 esc(r.label) + ' dishes</label>' +
+                 '<input class="q" id="q_' + esc(k) + '" data-q="1" ' +
+                 'role="combobox" aria-expanded="true" aria-controls="reslist" ' +
+                 'aria-autocomplete="list" autocomplete="off" ' +
+                 (applying ? 'disabled ' : '') +
+                 'value="' + esc(query) + '"></div>');
+          return;
+        }
+        var cls = "cell" + (c.nonveg ? " nonveg" : "") + (c.pinned ? " pinned" : "");
+        // A pinned cell carries no `data-cell`, so `wire` never binds it and
+        // it cannot join a selection — the rule already decided this dish.
+        h.push('<button class="' + cls + '"' +
+               (c.pinned ? ' aria-disabled="true"' : ' data-cell="' + esc(k) + '"') +
+               ' style="' + st + '" aria-pressed="' + on + '"' +
+               ' title="' + esc(c.title || c.name) + '">');
+        h.push('<span class="dot" style="background:' + esc(c.color_dot || "#FFFFFF") +
+               (c.color === "W" ? ';border:1px solid #AEAEAE' : '') + '"></span>');
+        if (c.pinned) h.push(ICON.pin);
+        h.push('<span class="nm">' + esc(c.name) + '</span>');
+        if (c.regional) {
+          h.push('<span class="rgn" title="' +
+                 esc((d.region || "Regional") + " dish \u2014 this is why today is a " +
+                     (d.region || "regional") + " day") + '">R</span>');
+        }
+        // At most ONE marker, and in this order: a tick for what you picked
+        // beats a warning you have already responded to by picking it.
+        // At most ONE marker, in this order: a tick for what you picked beats
+        // a warning you have already answered by picking it; the pencil
+        // ("chosen by you") beats the redo, because a manual cell is also a
+        // changed one and the planner needs to know which kind.
+        if (on) h.push('<span class="tail">' + ICON.tick + '</span>');
+        else if (c.warn) h.push('<span class="tail">' + ICON.warn + '</span>');
+        else if (c.manual) h.push('<span class="tail">' + ICON.pencil + '</span>');
+        else if (c.modified) h.push('<span class="tail">' + ICON.redo + '</span>');
+        h.push('</button>');
+      });
+      h.push('</div>');
+      if (pickCell && cellOf(pickCell).slot === r.id) h.push(resultsHtml());
+    });
+
+    h.push(exceptionsHtml());
+
+    h.push('</div>');
+    document.getElementById("root").innerHTML = h.join("");
+    wire();
+    restoreFocus();
+    setHeight();
+  }
+
+  function restoreFocus() {
+    // A full render replaces every node, the search input included, so the
+    // caret lands nowhere and the planner has to click back into the box
+    // after EVERY keystroke. `renderResults` avoids the rebuild for typing,
+    // but it is not the only thing that rebuilds: each keystroke changes the
+    // number of results, which changes the height, which makes us post
+    // `setFrameHeight`, and Streamlit answers a resize with a fresh
+    // `streamlit:render` — straight back into `render()`.
+    //
+    // So rather than hunting every path that can rebuild the table, put the
+    // caret back after all of them. Cheap, and it cannot be defeated by a
+    // path nobody thought of.
+    if (!pickCell || applying) return;
+    var input = document.querySelector("[data-q]");
+    if (!input || document.activeElement === input) return;
+    input.focus();
+    try { input.setSelectionRange(caret, caret); } catch (e) { /* not a text input */ }
+  }
+
+  function renderResults() {
+    // Typing rebuilds ONLY the results container. A full `render()` would
+    // replace the input element and the caret would jump to a fresh node, so
+    // the planner would lose focus after every keystroke.
+    var box = document.getElementById("resbox");
+    if (!box) return render();
+    var tmp = document.createElement("div");
+    tmp.innerHTML = resultsHtml();
+    box.parentNode.replaceChild(tmp.firstChild, box);
+    wireResults();
+    setHeight();
+  }
+
+  function wireResults() {
+    document.querySelectorAll("[data-pick]").forEach(function (el) {
+      el.onclick = function () { apply(el.getAttribute("data-pick")); };
+    });
+  }
+
+  function apply(name, cell) {
+    // One press is one request: `applying` makes the Enter key and a click
+    // on the same result idempotent while the server is answering.
+    var target = cell || pickCell;
+    if (applying || !target || !name) return;
+    applying = true;
+    status = "Applying\u2026";
+    statusErr = false;
+    setValue({action: "pick", cell: target, item: name, nonce: Date.now()});
+    render();
+  }
+
+  function undoFor(cell) {
+    // An undo IS a pick of the dish the solver originally put there, so it
+    // needs no second request shape, no second handler and no second replay
+    // guard. `ARGS.undo` carries that dish per cell.
+    return (ARGS.undo || {})[cell] || "";
+  }
+
+  function lastUndoCell() {
+    var order = ARGS.undo_order || [];
+    for (var i = order.length - 1; i >= 0; i--) {
+      if (undoFor(order[i])) return order[i];
+    }
+    return "";
+  }
+
+  function startPick(k) {
+    pickCell = k;
+    query = "";
+    highlight = 0;
+    render();
+    var input = document.querySelector("[data-q]");
+    if (input) input.focus();
+  }
+
+  function cancelPick() {
+    pickCell = null;
+    query = "";
+    highlight = 0;
+    render();
+  }
+
+  function wire() {
+    document.querySelectorAll("[data-cell]").forEach(function (el) {
+      el.onclick = function () {
+        var k = el.getAttribute("data-cell");
+        if (mode === "pick") { startPick(k); return; }
+        var i = selected.indexOf(k);
+        if (i === -1) selected.push(k); else selected.splice(i, 1);
+        render();                       // selection is local; no rerun yet
+      };
+    });
+    // A pinned cell has no `data-cell`, so it is not bound above and cannot
+    // be picked or selected. It still has to SAY why when clicked, or it
+    // reads as a dead control.
+    document.querySelectorAll(".cell.pinned").forEach(function (el) {
+      el.onclick = function () {
+        status = "Pinned by a client rule. Search and Regenerate can't " +
+                 "change it.";
+        statusErr = false;
+        render();
+      };
+    });
+    document.querySelectorAll("[data-mode]").forEach(function (el) {
+      el.onclick = function () {
+        var want = el.getAttribute("data-mode");
+        if (want === mode) return;
+        // Switching clears the selection and closes any open edit. It never
+        // changes the plan.
+        mode = want;
+        selected = [];
+        pickCell = null;
+        query = "";
+        status = want === "pick"
+          ? "Pick mode: click a dish to search the city list."
+          : "Auto mode: click dishes to select, then regenerate.";
+        statusErr = false;
+        render();
+      };
+    });
+    document.querySelectorAll("[data-undo]").forEach(function (el) {
+      el.onclick = function () {
+        var cell = el.getAttribute("data-undo");
+        apply(undoFor(cell), cell);
+      };
+    });
+    var exc = document.querySelector('[data-act="exc"]');
+    if (exc) exc.onclick = function () { excOpen = !excOpen; render(); };
+    wireResults();
+    var input = document.querySelector("[data-q]");
+    if (input) {
+      input.oninput = function () {
+        query = input.value;
+        caret = input.selectionStart;
+        highlight = 0;        // a new query invalidates the old highlight
+        renderResults();
+      };
+      input.onclick = input.onkeyup = function () {
+        caret = input.selectionStart;
+      };
+      input.onkeydown = function (e) {
+        var sel = selectable();
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          if (!sel.length) return;
+          var step = e.key === "ArrowDown" ? 1 : -1;
+          highlight = (highlight + step + sel.length) % sel.length;
+          renderResults();
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          if (sel[highlight]) apply(sel[highlight].name);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancelPick();
+        }
+      };
+    }
+    document.querySelectorAll("[data-why]").forEach(function (el) {
+      el.onclick = function () {
+        var i = +el.getAttribute("data-why");
+        openDay = (openDay === i) ? null : i;
+        render();
+      };
+    });
+    var clear = document.querySelector('[data-act="clear"]');
+    if (clear) clear.onclick = function () { selected = []; render(); };
+    var regen = document.querySelector('[data-act="regen"]');
+    // Only THIS sends a value back, so Streamlit reruns once per regenerate
+    // rather than once per click. nonce makes two identical requests distinct,
+    // otherwise the second is dropped as an unchanged widget value.
+    if (regen) regen.onclick = function () {
+      setValue({action: "regenerate", cells: selected.slice(), nonce: Date.now()});
+      selected = [];
+      render();
+    };
+  }
+
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    ARGS = e.data.args || {};
+    // A new plan replaces the table underneath; a stale selection would point
+    // at cells that are gone.
+    if (ARGS.reset_token !== undefined && ARGS.reset_token !== window.__token) {
+      window.__token = ARGS.reset_token;
+      selected = [];
+      openDay = null;
+      pickCell = null;
+      query = "";
+      status = "";
+      serverLocked = {};
+    }
+    // New arguments mean the server answered: a pick that was in flight is
+    // done, one way or the other. Streamlit re-renders the component after
+    // the rerun that handled it, so this is the only signal there is.
+    if (applying) {
+      applying = false;
+      pickCell = null;
+      query = "";
+    }
+    if (ARGS.status) { status = ARGS.status; statusErr = !!ARGS.status_error; }
+    // A dish the SERVER refused as a week repeat (saved history, which the
+    // embedded list cannot see). Remembered so the planner is not offered it
+    // again for the rest of this edit.
+    if (ARGS.locked_item) serverLocked[norm(ARGS.locked_item)] = ARGS.locked_on || "another day";
+    render();
+  });
+
+  post("streamlit:componentReady", {apiVersion: 1});
+  setHeight();
+})();
+</script>

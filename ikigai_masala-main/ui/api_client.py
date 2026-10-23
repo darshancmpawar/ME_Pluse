@@ -1,0 +1,669 @@
+"""
+HTTP client for the Menu Planning Flask API.
+"""
+
+import random
+import time
+from typing import Any, Callable, Dict, List, Optional
+
+import requests
+
+
+# HTTP statuses where a one-shot retry is safe and likely to succeed:
+#   429: rate limiter rejected us — bucket refills quickly, one retry
+#        after jitter often lands inside the next burst.
+#   503: solver_gate queue full — the request never ran server-side.
+#   502/504: proxy hiccup — rare, but a single retry is cheap.
+# 5xx beyond these (500, 501) usually mean a genuine server-side error
+# that will repeat; don't retry those.
+_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_RETRY_BACKOFF_MIN_SEC = 0.2
+_RETRY_BACKOFF_MAX_SEC = 0.7
+#: Ceiling on a 429's `Retry-After`. The retry happens inside a Streamlit
+#: rerun, so a long or malformed header must not park the UI.
+_RETRY_AFTER_MAX_SEC = 5.0
+
+
+class RuleDiagnosticsBlockedError(RuntimeError):
+    """Raised by ``_parse_response`` when the server returned 422 with
+    ``error == 'rule_diagnostics_blocked'``.
+
+    Carries the structured ``rule_diagnostics`` list + ``summary`` dict
+    so the Streamlit UI can render the diagnostics expander without
+    needing a second API round-trip. The default str() of the
+    exception is the human-readable server message — works as a plain
+    RuntimeError for any caller that doesn't know about the subclass.
+    """
+
+    def __init__(self, message: str, diagnostics: List[Dict[str, Any]],
+                 summary: Dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+        self.summary = summary
+
+
+class SolverFailedError(RuntimeError):
+    """The request passed pre-flight and the solve then failed.
+
+    Same shape as :class:`RuleDiagnosticsBlockedError` and for the same reason:
+    the response body carries the pre-flight ``rule_diagnostics``, and those
+    warnings are the only clue to *which* rules are in conflict. Without this the
+    UI showed one sentence naming nothing. Subclasses RuntimeError, so existing
+    ``except RuntimeError`` handlers are unaffected.
+    """
+
+    def __init__(self, message: str, diagnostics: List[Dict[str, Any]],
+                 summary: Dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+        self.summary = summary
+
+
+class PickRejectedError(RuntimeError):
+    """A `/pick` the server refused, with the reason machine-readable.
+
+    `code` is from the contract's closed set (`week_repeat`, `pinned_cell`,
+    `not_a_slot_dish`, `unknown_cell`, `bad_date`, `bad_request`). Subclasses
+    RuntimeError so existing handlers keep catching it.
+    """
+
+    def __init__(self, message: str, code: str = "", details=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.details = details or {}
+
+
+def _parse_response(resp: requests.Response, default_error: str) -> Dict[str, Any]:
+    """Decode a JSON API response and raise on any non-success.
+
+    Handles the API's common envelope: ``{"success": bool, ...}``. If the
+    server returned HTML or a non-JSON body (for example a 502 from an
+    upstream proxy), ``data`` becomes ``{}`` and the fallback message is
+    built from the default prefix and status code.
+
+    A 422 with ``error == 'rule_diagnostics_blocked'`` raises a
+    :class:`RuleDiagnosticsBlockedError` (subclass of RuntimeError) so
+    callers that catch RuntimeError keep working, but the UI can
+    isinstance-check to render the diagnostics expander directly.
+    """
+    ct = resp.headers.get("content-type", "")
+    data: Dict[str, Any] = resp.json() if ct.startswith("application/json") else {}
+    if (
+        resp.status_code == 422
+        and data.get("error") == "rule_diagnostics_blocked"
+    ):
+        # The 422 path carries structured diagnostics in the body —
+        # expose them via the typed exception. The .message defaults
+        # to the server's human-readable text so plain RuntimeError
+        # handlers still get something useful.
+        raise RuleDiagnosticsBlockedError(
+            data.get("message")
+            or "Pre-flight diagnostics blocked the request.",
+            diagnostics=data.get("rule_diagnostics") or [],
+            summary=data.get("summary") or {},
+        )
+    if not resp.ok or not data.get("success"):
+        message = data.get("error", f"{default_error} ({resp.status_code})")
+        if data.get("rule_diagnostics"):
+            raise SolverFailedError(
+                message,
+                diagnostics=data.get("rule_diagnostics") or [],
+                summary=data.get("summary") or {},
+            )
+        raise RuntimeError(message)
+    return data
+
+
+def _with_one_retry(
+    do_request: Callable[[], requests.Response],
+    *,
+    retryable: bool,
+    sleep: Callable[[float], None] = time.sleep,
+    rng: Optional[random.Random] = None,
+) -> requests.Response:
+    """Run ``do_request``; if *retryable* and the response is a transient
+    5xx, sleep with jitter and try once more.
+
+    Kept as a tiny helper rather than baked into each method so the retry
+    policy is visible in one place and testable without patching every
+    call site. Injection seams for ``sleep`` + ``rng`` keep the tests
+    deterministic without touching ``time`` globals.
+    """
+    resp = do_request()
+    if not retryable or resp.status_code not in _RETRY_STATUSES:
+        return resp
+    backoff = (rng or random).uniform(_RETRY_BACKOFF_MIN_SEC, _RETRY_BACKOFF_MAX_SEC)
+    # A 429 is not transient in the way a 502 is: the bucket refills at a known
+    # rate and the server says how long that takes in `Retry-After`. Sleeping the
+    # jitter backoff instead made this retry USELESS on the one status where a
+    # retry is guaranteed to work if you wait — /plan refills 0.3 tokens a second,
+    # so a 0.2-0.7s nap never produced one and the second request 429'd too. On a
+    # multi-counter client that cost a whole counter its menu.
+    retry_after = _retry_after_seconds(resp)
+    if retry_after is not None:
+        backoff = max(backoff, retry_after)
+    sleep(backoff)
+    return do_request()
+
+
+def _retry_after_seconds(resp: requests.Response) -> Optional[float]:
+    """Seconds from a 429's ``Retry-After``, or None.
+
+    Capped at ``_RETRY_AFTER_MAX_SEC``: this runs inside a Streamlit rerun, so an
+    absent or absurd header must not park the UI. Anything longer than the cap is
+    better reported than waited out.
+    """
+    if resp.status_code != 429:
+        return None
+    raw = resp.headers.get('Retry-After')
+    if raw is None:
+        return None
+    try:
+        wait = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if wait <= 0:
+        return None
+    return min(wait, _RETRY_AFTER_MAX_SEC)
+
+
+class MenuApiClient:
+    """Wrapper around the Flask API endpoints."""
+
+    def __init__(self, base_url: str = "http://localhost:5000"):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+    def health(self) -> Dict[str, Any]:
+        resp = self.session.get(f"{self.base_url}/api/v1/health", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_clients(self) -> List[str]:
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/clients", timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        data = _parse_response(resp, "Failed to list clients")
+        return data["clients"]
+
+    def list_clients_with_city(self) -> List[Dict[str, Any]]:
+        """Return ``[{'name', 'city'}, …]`` — powers the sidebar's city filter.
+
+        Falls back to ``city=None`` entries if the server is old enough not to
+        send ``clients_detail``.
+        """
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/clients", timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        data = _parse_response(resp, "Failed to list clients")
+        detail = data.get("clients_detail")
+        if detail is None:
+            return [{"name": n, "city": None} for n in data.get("clients", [])]
+        return detail
+
+    def plan(
+        self,
+        client_name: str,
+        start_date: str,
+        num_days: int = 5,
+        time_limit_seconds: int = 240,
+        counter_index: int = 0,
+        shared_items: Optional[List[Any]] = None,
+        meal: Optional[str] = None,
+        exclude_items: Optional[Dict[str, List[str]]] = None,
+        region_days: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "client_name": client_name,
+            "start_date": start_date,
+            "num_days": num_days,
+            "time_limit_seconds": time_limit_seconds,
+            "counter_index": counter_index,
+        }
+        # Cross-counter common categories: the primary counter's dishes for the
+        # shared base slots, as [[date, slot_id, item], …]. The server pins them.
+        if shared_items:
+            payload["shared_items"] = shared_items
+        # Which service this is. Only ever echoed back by /plan — the solve is
+        # identical — but it is what /save keys the history row on, so the two
+        # calls have to agree and the planner carries one value through both.
+        if meal:
+            payload["meal"] = meal
+        # `{iso_date: [item, …]}` — dishes an EARLIER service the same day has
+        # already committed, folded into the ban map server-side. This is what
+        # keeps dinner off lunch's dishes: the two are separate solves, so
+        # `unique_items` cannot see across them.
+        if exclude_items:
+            payload["exclude_items"] = exclude_items
+        # `{iso_date: region}` — a regional focus for named days. The floor it
+        # becomes never removes a cell, so an unservable pick degrades to fewer
+        # regional dishes rather than a thinner menu; anything the server could
+        # not honour comes back in `region_problems`.
+        if region_days:
+            payload["region_days"] = region_days
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/plan", json=payload,
+                timeout=time_limit_seconds + 30,
+            )
+        # Retry is safe: /plan has no side effects (nothing is written
+        # to history until /save), so the worst case is a second solve.
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Plan failed")
+
+    def regenerate(
+        self,
+        client_name: str,
+        base_plan: Dict[str, Dict[str, str]],
+        replace_slots: Dict[str, List[str]],
+        start_date: Optional[str] = None,
+        num_days: int = 5,
+        time_limit_seconds: int = 240,
+        counter_index: int = 0,
+        exclude_items: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        region_days: Optional[Dict[str, str]] = None,
+        meal: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "client_name": client_name,
+            "base_plan": base_plan,
+            "replace_slots": replace_slots,
+            "num_days": num_days,
+            "time_limit_seconds": time_limit_seconds,
+            "counter_index": counter_index,
+        }
+        if start_date:
+            payload["start_date"] = start_date
+        # Items already shown for a cell this session, so repeated regenerations
+        # don't cycle A->B->A. {iso_date: {slot_id: [item, …]}}.
+        if exclude_items:
+            payload["exclude_items"] = exclude_items
+        # Applying a regional day re-solves ONE day: the mask names that day's
+        # cells and this names the region they are re-solved under.
+        if region_days:
+            payload["region_days"] = region_days
+        # The service decides WHICH counters `counter_index` indexes, for a
+        # site that runs different stations at lunch and at dinner.
+        if meal:
+            payload["meal"] = meal
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/regenerate", json=payload,
+                timeout=time_limit_seconds + 30,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Regenerate failed")
+
+    def pick(
+        self,
+        client_name: str,
+        base_plan: Dict[str, Dict[str, str]],
+        picks: Dict[str, Dict[str, str]],
+        start_date: Optional[str] = None,
+        num_days: int = 5,
+        counter_index: int = 0,
+        meal: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Put named dishes in cells. No solve, so no long timeout.
+
+        Refusals raise :class:`PickRejectedError` rather than a plain
+        RuntimeError, because the planner's next move depends on WHICH
+        refusal it was: a `week_repeat` means the table should lock that dish
+        for the rest of the edit, while a `pinned_cell` means the cell was
+        never editable. A bare message cannot be branched on without matching
+        English text, which breaks the first time the wording is improved.
+        """
+        payload: Dict[str, Any] = {
+            "client_name": client_name,
+            "base_plan": base_plan,
+            "picks": picks,
+            "num_days": num_days,
+            "counter_index": counter_index,
+        }
+        if start_date:
+            payload["start_date"] = start_date
+        if meal:
+            payload["meal"] = meal
+
+        def _do():
+            # 30s, not the solver's budget: `/pick` runs no CP-SAT. A timeout
+            # here means the server is unwell, not that a plan is hard.
+            return self.session.post(
+                f"{self.base_url}/api/v1/pick", json=payload, timeout=30,
+            )
+
+        # Not retryable. A pick is not idempotent in the way a regenerate is:
+        # the first attempt may have applied, and a blind retry would then be
+        # refused as a `week_repeat` against the dish it just placed.
+        resp = _do()
+        ct = resp.headers.get("content-type", "")
+        data = resp.json() if ct.startswith("application/json") else {}
+        if not resp.ok or not data.get("success"):
+            raise PickRejectedError(
+                data.get("error") or f"Pick failed ({resp.status_code})",
+                code=str(data.get("code") or ""),
+                details=data.get("details") or {},
+            )
+        return data
+
+    def save(
+        self,
+        client_name: str,
+        week_start: str,
+        week_plan: Optional[Dict[str, Dict[str, str]]] = None,
+        counters: Optional[List[Dict[str, Any]]] = None,
+        meal: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        # /save overwrites on (client, dates, meal) — re-saving the same week
+        # is idempotent (DELETE + INSERT under the hood). Pass ``week_plan``
+        # for a single-cuisine client, or ``counters`` (a list of
+        # {name, week_plan}) for a multi-cuisine client.
+        #
+        # ``meal`` is part of the history key, so omitting it on a dinner save
+        # would overwrite that day's LUNCH row rather than sit beside it — the
+        # two services are different menus for the same date.
+        payload: Dict[str, Any] = {
+            "client_name": client_name,
+            "week_start": week_start,
+        }
+        if meal:
+            payload["meal"] = meal
+        if counters is not None:
+            payload["counters"] = counters
+        else:
+            payload["week_plan"] = week_plan or {}
+        resp = self.session.post(
+            f"{self.base_url}/api/v1/save", json=payload, timeout=30,
+        )
+        return _parse_response(resp, "Save failed")
+
+    def diagnose(
+        self, client_name: str, start_date: str, num_days: int = 5,
+    ) -> Dict[str, Any]:
+        """Run pre-flight diagnostics for *(client, start_date, num_days)*.
+
+        Never invokes the solver. Returns the structured envelope:
+        ``{success, rule_diagnostics, summary, pool_warnings?}``.
+
+        Used by Streamlit to dry-run a config before committing solver
+        time, and by the unit tests that verify /diagnose and /plan's
+        pre-flight produce identical diagnostics.
+        """
+        payload = {
+            "client_name": client_name,
+            "start_date": start_date,
+            "num_days": num_days,
+        }
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/diagnose", json=payload,
+                timeout=15,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Diagnose failed")
+
+    def explain(
+        self,
+        client_name: str,
+        start_date: str,
+        solution: Dict[str, Any],
+        num_days: int = 5,
+        counter_index: int = 0,
+        relaxations: Optional[List[Dict[str, Any]]] = None,
+        chef_read: bool = False,
+        region_days: Optional[Dict[str, str]] = None,
+        meal: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Explain a plan this client already has. Never solves.
+
+        ``chef_read=True`` is the "Ask the chef" button: the server then also
+        writes the chef's read for every day. It can take up to a minute per
+        day (up to three model calls each), so the timeout grows with the plan
+        and the request is NOT retried blindly: a retry would spend the model
+        quota twice. ``region_days`` lets the read know a day is, say, a Tamil
+        Nadu day; without it the facts never mention the region, because a
+        region is not recoverable from the solution.
+
+        ``relaxations`` comes from the ``plan()`` response and cannot be
+        recomputed here — the solver's "I could not fully enforce this" lines
+        are only observable while it runs. Pass them through or the explanation
+        silently stops mentioning which rule did not hold.
+
+        Returns ``{success, days: [{date, bullets, prose, checks, …}], …}``.
+        ``prose`` is None unless the optional model is enabled AND its reply
+        passed the validator; ``bullets`` are always present.
+        """
+        payload: Dict[str, Any] = {
+            "client_name": client_name,
+            "start_date": start_date,
+            "num_days": num_days,
+            "counter_index": counter_index,
+            "solution": solution,
+        }
+        if relaxations:
+            payload["relaxations"] = relaxations
+        # The service decides WHICH counters `counter_index` indexes, for a
+        # site that runs different stations at lunch and at dinner.
+        if meal:
+            payload["meal"] = meal
+        if chef_read:
+            payload["chef_read"] = True
+        if region_days:
+            payload["region_days"] = region_days
+        timeout = min(600, 60 + 60 * max(1, int(num_days))) if chef_read else 45
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/explain", json=payload, timeout=timeout,
+            )
+        resp = _with_one_retry(_do, retryable=not chef_read)
+        return _parse_response(resp, "Explain failed")
+
+    def seasonal_bans(
+        self,
+        client_name: str,
+        start_date: str,
+        num_days: int = 5,
+        counter_index: int = 0,
+        dishes_by_date: Optional[Dict[str, List[Dict[str, str]]]] = None,
+        kitchen_notes: bool = False,
+    ) -> Dict[str, Any]:
+        """The month's high-risk vegetable list for this plan, for the seasonal panel.
+
+        ``kitchen_notes=True`` (sent when the panel is opened and a menu
+        exists) asks the server to have the model write notes for these
+        dishes; that can take a few model calls, so the wait is longer and the
+        request is not retried blindly.
+        """
+        payload: Dict[str, Any] = {
+            "client_name": client_name, "start_date": start_date,
+            "num_days": num_days, "counter_index": counter_index,
+        }
+        if dishes_by_date:
+            payload["dishes_by_date"] = dishes_by_date
+        if kitchen_notes:
+            payload["kitchen_notes"] = True
+        timeout = 150 if kitchen_notes else 45
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/seasonal-bans", json=payload, timeout=timeout,
+            )
+        resp = _with_one_retry(_do, retryable=not kitchen_notes)
+        return _parse_response(resp, "Seasonal list failed")
+
+    def get_saved_plan(
+        self, client_name: str, start_date: str, num_days: int = 5,
+        meal: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return the saved plan for *(client, start_date, num_days, meal)*.
+
+        Response carries ``exists`` (True iff every requested weekday is
+        covered) and ``solution`` in the same shape as ``plan()``. The
+        UI uses ``exists`` to decide whether to display the saved plan
+        directly or fall back to running the solver.
+
+        ``meal`` selects the service; omitted, the server reads lunch, which
+        is what every row predating the column is.
+        """
+        params = {
+            "client_name": client_name,
+            "start_date": start_date,
+            "num_days": num_days,
+        }
+        if meal:
+            params["meal"] = meal
+
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/saved-plan", params=params,
+                timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Failed to load saved plan")
+
+    def get_regions(self, city=None) -> Dict[str, Any]:
+        """Regions *city*'s item list can theme a day with.
+
+        Its own call, made only when somebody switches the regional toggle on:
+        it costs one workbook read (cached thereafter), and a user who never
+        asks for a regional day should not pay for it. `available` is False for
+        every city today — the regional columns arrived with the client's
+        corrected workbooks, which are not installed — and the planner hides
+        the whole control on that.
+        """
+        params = {'city': city} if city else None
+
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/regions", timeout=30, params=params,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Failed to load regions")
+
+    # ----- Customisation editor endpoints -----
+
+    def get_editor_metadata(self, city=None) -> Dict[str, Any]:
+        """Editor metadata. Pass ``city`` once one is known.
+
+        Without it the API computes pool tokens for EVERY city, which parses every
+        city's workbook — 4.8 s of cold start to answer a question about a handful
+        of strings. With it, one workbook.
+        """
+        params = {'city': city} if city else None
+
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/editor-metadata", timeout=10,
+                params=params,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Failed to load metadata")
+
+    def get_client_config(self, client_name: str) -> Dict[str, Any]:
+        def _do():
+            return self.session.get(
+                f"{self.base_url}/api/v1/client-config/{client_name}", timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Failed to load config")
+
+    def update_client_config(self, client_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        # PUT is idempotent thanks to the optimistic version check — a
+        # retry after 502/504 is safe: either the first call landed
+        # (second gets 409), or it didn't (second applies cleanly).
+        def _do():
+            return self.session.put(
+                f"{self.base_url}/api/v1/client-config/{client_name}",
+                json=config, timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Save failed")
+
+    def pool_preview(
+        self, source_pools: List[str], city: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Preview the eligible item pool (count + category breakdown) for a
+        set of source pools (F5 config UI). ``common`` is always included.
+
+        *city* selects which city's item list is counted — without it the editor
+        would show a Pune client the default city's counts.
+        """
+        body: Dict[str, Any] = {"source_pools": list(source_pools or [])}
+        if city:
+            body["city"] = city
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/pool-preview", json=body, timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Pool preview failed")
+
+    def create_client(
+        self,
+        name: str,
+        active_slots: Optional[list] = None,
+        *,
+        counter_mode: Optional[str] = None,
+        counters: Optional[List[Dict[str, Any]]] = None,
+        city: Optional[str] = None,
+        serve_weekends: Optional[bool] = None,
+        meals: Optional[List[str]] = None,
+        item_cooldown_days: Optional[int] = None,
+        source_pools: Optional[List[str]] = None,
+        is_launch_site: Optional[bool] = None,
+        shared_categories: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        # Creating the same name twice is caught server-side (409 / "already
+        # exists"), so a retry after a proxy 502 is self-correcting.
+        #
+        # Two shapes: classic (active_slots → one implicit counter) or
+        # counter-aware (counter_mode + counters). When counters are given
+        # they take precedence server-side.
+        payload: Dict[str, Any] = {"name": name}
+        if counters is not None:
+            payload["counters"] = counters
+            payload["counter_mode"] = counter_mode or "single"
+        else:
+            payload["active_slots"] = active_slots or []
+        if city is not None:
+            payload["city"] = city
+        if serve_weekends is not None:
+            payload["serve_weekends"] = bool(serve_weekends)
+        if meals is not None:
+            payload["meals"] = list(meals)
+        if item_cooldown_days is not None:
+            payload["item_cooldown_days"] = int(item_cooldown_days)
+        if source_pools is not None:
+            payload["source_pools"] = list(source_pools)
+        if is_launch_site is not None:
+            payload["is_launch_site"] = bool(is_launch_site)
+        if shared_categories is not None:
+            payload["shared_categories"] = list(shared_categories)
+
+        def _do():
+            return self.session.post(
+                f"{self.base_url}/api/v1/client",
+                json=payload,
+                timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Create failed")
+
+    def delete_client(self, client_name: str) -> Dict[str, Any]:
+        # Idempotent: if the first call landed, the second gets 404.
+        def _do():
+            return self.session.delete(
+                f"{self.base_url}/api/v1/client/{client_name}", timeout=10,
+            )
+        resp = _with_one_retry(_do, retryable=True)
+        return _parse_response(resp, "Delete failed")
